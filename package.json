@@ -1,8 +1,7 @@
 {
   "name": "goldqueen-yasmin-call",
-  "version": "1.0.0",
+  "version": "4.0.0",
   "type": "module",
-  "main": "server-goldqueen-call.js",
   "scripts": {
     "start": "node server-goldqueen-call.js"
   },
