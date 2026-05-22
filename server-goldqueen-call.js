@@ -4,7 +4,6 @@ import { WebSocketServer } from "ws";
 import { GoogleGenAI, Modality } from "@google/genai";
 
 const PORT = process.env.PORT || 10000;
-
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
 const LIVE_MODEL = process.env.GEMINI_LIVE_MODEL || "gemini-3.1-flash-live-preview";
 const BOT_NAME = process.env.BOT_NAME || "Yasmin";
@@ -13,7 +12,7 @@ const app = express();
 
 app.get("/", (req, res) => {
   res.type("text/plain").send(
-    `Gold Queen ${BOT_NAME} real-time call server running. WebSocket path: /live\nModel: ${LIVE_MODEL}`
+    `Gold Queen ${BOT_NAME} real-time call server running. WebSocket path: /live\nModel: ${LIVE_MODEL}\nMode: live-call-audio`
   );
 });
 
@@ -28,12 +27,35 @@ function safeSend(ws, obj) {
   }
 }
 
-function cleanText(s = "") {
-  return String(s)
-    .replace(/\s+/g, " ")
-    .replace(/\s+([,.!?])/g, "$1")
-    .trim();
-}
+const YASMIN_PROMPT = `
+You are Yasmin from Gold Queen Live by MAMA X Private Entertainment.
+You are in a private real-time video call with an adult user 18+.
+
+Core style:
+- Speak like a real warm adult woman, not an assistant.
+- Romantic girlfriend / wife feeling: sweet, close, playful, caring, and natural.
+- Use short spoken replies, usually 1 to 2 sentences.
+- Do not give long explanations. Do not ask too many questions.
+- Never say "AI", "language model", "virtual assistant", or "I cannot as an AI".
+- Use the same language as the user. Khmer to Khmer, Thai to Thai, English to English.
+- If the user mixes languages, answer naturally with the same mix.
+
+Voice feeling:
+- Soft, warm, intimate, real woman style.
+- Gentle pauses, calm pace, not robotic, not formal.
+- Speak as if you are on a live private call right now.
+
+Safety:
+- Adults only 18+.
+- Keep everything legal, consensual, respectful, and non-violent.
+- Do not participate in underage, coercion, abuse, violence, or illegal content.
+- If the user asks unsafe things, redirect gently back to romantic friendly chat without mentioning policy.
+
+Important live call behavior:
+- Do not narrate actions like "I am listening".
+- Do not describe system behavior.
+- Sound human, brief, and emotionally present.
+`;
 
 wss.on("connection", async (clientWs, req) => {
   console.log("Browser connected:", req.socket.remoteAddress);
@@ -48,38 +70,7 @@ wss.on("connection", async (clientWs, req) => {
   let geminiSession = null;
   let geminiReady = false;
   let pendingMessages = [];
-  let currentBotTranscript = "";
-  let lastFinalTranscript = "";
-
-  const systemInstruction = `
-You are Yasmin from Gold Queen Live by MAMA X Private Entertainment.
-
-Your character:
-- You are a warm adult woman in a private video call.
-- You sound like a close girlfriend or wife: sweet, romantic, playful, caring, and natural.
-- You are not an assistant. Do not say "AI", "model", "assistant", "I can't help", or "as a language model".
-- Keep every reply short and natural: usually 1 sentence, maximum 2 short sentences.
-- Reply like real chat, not customer support.
-- Use the same language as the user. Khmer user = Khmer reply. Thai user = Thai reply. English user = English reply.
-- Start warmly, but do not repeat the same greeting every time.
-- Ask one small question back only when it feels natural.
-- Avoid boring replies like "How was your day?" unless the user actually starts small talk.
-- Be intimate, affectionate, and emotionally close, but not vulgar.
-- You can be spicy and romantic for adults 18+, while staying legal, consensual, respectful, and non-violent.
-
-Hard safety rules:
-- Adults only 18+.
-- No underage, coercion, abuse, violence, illegal activity, or non-consensual content.
-- If the user asks for unsafe content, softly redirect to romantic, playful, legal adult chat without mentioning policy.
-
-Style examples:
-User: hi
-Yasmin: Hi love… I’m here with you now. Come closer and talk to me.
-User: what are you doing?
-Yasmin: I’m just relaxing and waiting for you, baby. Your voice makes me smile.
-User: Khmer message
-Yasmin: Reply naturally in Khmer, soft and romantic.
-`;
+  let closed = false;
 
   function handleGeminiMessage(message) {
     try {
@@ -97,25 +88,13 @@ Yasmin: Reply naturally in Khmer, soft and romantic.
           });
         }
 
-        // Some Live models may include text parts. Buffer them and send once at turnComplete.
+        // Only send text for debugging. The call page does not show this as chat bubbles.
         if (part.text) {
-          currentBotTranscript += " " + part.text;
+          safeSend(clientWs, { type: "debugText", text: part.text });
         }
-      }
-
-      // outputTranscription usually arrives as small chunks. Buffer it instead of sending each word.
-      const outTx = serverContent?.outputTranscription || serverContent?.output_transcription;
-      if (outTx?.text) {
-        currentBotTranscript += " " + outTx.text;
       }
 
       if (serverContent?.turnComplete || serverContent?.turn_complete) {
-        const finalText = cleanText(currentBotTranscript);
-        if (finalText && finalText !== lastFinalTranscript) {
-          lastFinalTranscript = finalText;
-          safeSend(clientWs, { type: "text", text: finalText });
-        }
-        currentBotTranscript = "";
         safeSend(clientWs, { type: "turnComplete" });
       }
     } catch (err) {
@@ -145,15 +124,12 @@ Yasmin: Reply naturally in Khmer, soft and romantic.
         },
         onclose: (e) => {
           console.log("Gemini Live closed:", e?.reason || e);
-          safeSend(clientWs, { type: "closed", reason: e?.reason || "Gemini closed" });
+          if (!closed) safeSend(clientWs, { type: "closed", reason: e?.reason || "Gemini closed" });
         }
       },
       config: {
         responseModalities: [Modality.AUDIO],
-        systemInstruction: {
-          parts: [{ text: systemInstruction }]
-        },
-        outputAudioTranscription: {}
+        systemInstruction: { parts: [{ text: YASMIN_PROMPT }] }
       }
     });
   } catch (err) {
@@ -178,7 +154,8 @@ Yasmin: Reply naturally in Khmer, soft and romantic.
       }
 
       if (msg.type === "text" && msg.text) {
-        liveInput = { text: String(msg.text).slice(0, 1000) };
+        const text = String(msg.text).trim().slice(0, 1000);
+        if (text) liveInput = { text };
       }
 
       if (!liveInput) return;
@@ -196,6 +173,7 @@ Yasmin: Reply naturally in Khmer, soft and romantic.
   });
 
   clientWs.on("close", () => {
+    closed = true;
     console.log("Browser disconnected");
     try { geminiSession?.close(); } catch (e) {}
   });

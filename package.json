@@ -1,7 +1,6 @@
 {
   "name": "goldqueen-yasmin-realtime-call",
   "version": "1.0.0",
-  "description": "Gold Queen Yasmin real-time Gemini Live call server",
   "type": "module",
   "main": "server-goldqueen-call.js",
   "scripts": {
