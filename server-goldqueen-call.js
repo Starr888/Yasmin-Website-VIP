@@ -229,5 +229,6 @@ server.listen(PORT, () => {
   console.log(`Gold Queen Yasmin call server running on port ${PORT}`);
   console.log(`WebSocket path: /live`);
   console.log(`Model: ${LIVE_MODEL}`);
-  console.log(`Voice: ${GEMINI_VOICE}`);\n  console.log(`Version: yasmin-young-sweet-spicy-v6`);
+  console.log(`Voice: ${GEMINI_VOICE}`);
+  console.log(`Version: yasmin-young-sweet-spicy-v6-deploy-fix`);
 });
