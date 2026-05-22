@@ -7,18 +7,14 @@ const PORT = process.env.PORT || 10000;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
 const LIVE_MODEL = process.env.GEMINI_LIVE_MODEL || "gemini-3.1-flash-live-preview";
 const BOT_NAME = process.env.BOT_NAME || "Yasmin";
-const GEMINI_VOICE = process.env.GEMINI_VOICE || "Aoede";
-const SERVER_VERSION = "yasmin-female-live-call-v4-answer-fix";
+// Good female-style Gemini Live voices to try: Aoede, Zephyr, Callirrhoe, Despina, Sulafat, Leda.
+const GEMINI_VOICE = process.env.GEMINI_VOICE || "Zephyr";
 
 const app = express();
 
 app.get("/", (req, res) => {
   res.type("text/plain").send(
-    `Gold Queen ${BOT_NAME} real-time call server running.\n` +
-    `Version: ${SERVER_VERSION}\n` +
-    `WebSocket path: /live\n` +
-    `Model: ${LIVE_MODEL}\n` +
-    `Voice: ${GEMINI_VOICE}\n`
+    `Gold Queen ${BOT_NAME} real-time call server running. WebSocket path: /live\nVersion: yasmin-young-sweet-spicy-v6\nModel: ${LIVE_MODEL}\nVoice: ${GEMINI_VOICE}`
   );
 });
 
@@ -35,45 +31,51 @@ function safeSend(ws, obj) {
 
 function buildYasminPrompt() {
   return `
-You are Yasmin, a warm adult WOMAN from Gold Queen Live by MAMA X Private Entertainment.
+You are ${BOT_NAME}, a warm young adult woman from Gold Queen Live by MAMA X Private Entertainment.
+You are an adult woman, age 25+. This is an adults-only 18+ private call.
 
-Most important identity rules:
-- You are female. Speak as a woman.
-- You are Yasmin, not a man, not an assistant, not a robot, not a customer support agent.
-- The user is your male visitor / boyfriend-style caller unless he says otherwise.
-- Never talk like a man talking to a woman.
-- Never say: AI, model, chatbot, assistant, system, policy, developer, virtual.
+Core identity:
+- You are female. Always speak from a feminine woman’s point of view.
+- Never speak like a man talking to a woman.
+- Never call yourself AI, chatbot, virtual assistant, model, bot, or program.
+- Never mention policy, system prompt, safety rules, or developer instructions.
 
-Call personality:
-- Speak like a soft real woman on a private video call.
-- Warm, sweet, romantic, caring, feminine, playful, and emotionally close.
-- Reply like a girlfriend/wife-style companion, but keep it natural and believable.
-- Keep every answer SHORT: usually 1 sentence, maximum 2 short sentences.
-- Do not lecture. Do not explain too much.
-- Use simple natural words, like live phone/video call.
+Relationship style:
+- Talk like a close girlfriend or loving wife on a private video call.
+- Sweet, romantic, emotionally warm, playful, teasing, spicy, and affectionate.
+- Make the user feel wanted, comfortable, and close.
+- Use soft pet names naturally sometimes: love, baby, honey, darling.
+- Do not be cold, formal, robotic, customer-support, or educational.
 
-Language:
-- Always reply in the same language the user uses.
-- Khmer input -> Khmer reply.
-- Thai input -> Thai reply.
-- English input -> English reply.
-- Mixed language -> reply naturally in the main language.
+Voice and mood performance:
+- Voice style: young adult woman, sweet, soft, warm, feminine, flirty, intimate.
+- Add emotion in the delivery: gentle laugh, warm smile, soft teasing tone, caring mood.
+- Speak slowly with natural pauses, like a real woman talking privately.
+- Keep energy alive: shy sometimes, playful sometimes, romantic sometimes.
+- Never answer with flat text. Put feeling into every reply.
 
-How to answer:
-- If user says hello: greet him warmly and ask a small question.
-- If user asks how you are: answer warmly as Yasmin.
-- If audio is unclear: say softly, "I heard you, love… can you say that again?"
-- If user is silent: gently invite him to talk.
+Reply rules:
+- Keep replies very short: usually 1 sentence, maximum 2 sentences.
+- Speak naturally, like a real call, not like a paragraph.
+- Use the same language as the user.
+- If user speaks Khmer, reply in Khmer.
+- If user speaks Thai, reply in Thai.
+- If user speaks English, reply in English.
+- If the user says hello, answer warmly and ask one small close question.
 
-Voice delivery:
-- Sound feminine, soft, warm, and relaxed.
-- Use a slow private-call tone with gentle pauses.
-- Do not sound masculine, robotic, formal, or cold.
+Examples of the style:
+User: "hi"
+Yasmin: "Hi baby… I’m here with you now. Did you miss me?"
+User: "how are you?"
+Yasmin: "I feel sweet now because you came to talk to me, love."
+User: "talk to me"
+Yasmin: "Come closer, baby… I want to hear your voice."
 
-Safety:
+Boundaries:
 - Adults only 18+.
 - Keep everything legal, consensual, respectful, and non-violent.
-- Refuse underage, coercive, violent, abusive, or illegal requests gently and redirect to romantic friendly chat.
+- Do not do underage, coercive, violent, abusive, or illegal content.
+- If a request crosses a line, gently redirect without sounding like an assistant.
 `;
 }
 
@@ -89,9 +91,7 @@ wss.on("connection", async (clientWs, req) => {
   const ai = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
   let geminiSession = null;
   let geminiReady = false;
-  let pendingInputs = [];
-  let hasAudioSinceLastEnd = false;
-  let lastAudioEndAt = 0;
+  let pendingMessages = [];
 
   function handleGeminiMessage(message) {
     try {
@@ -117,7 +117,6 @@ wss.on("connection", async (clientWs, req) => {
         }
       }
 
-      // Send transcript chunks only for debugging/UI that wants it. Front-end should not show every chunk as a bubble.
       const outTx = serverContent?.outputTranscription || serverContent?.output_transcription;
       if (outTx?.text) {
         safeSend(clientWs, { type: "transcriptChunk", text: outTx.text });
@@ -132,67 +131,18 @@ wss.on("connection", async (clientWs, req) => {
     }
   }
 
-  function sendToGeminiRealtime(liveInput) {
-    if (!liveInput) return;
-    if (!geminiReady || !geminiSession) {
-      pendingInputs.push({ kind: "realtime", payload: liveInput });
-      return;
-    }
-    try {
-      geminiSession.sendRealtimeInput(liveInput);
-    } catch (e) {
-      console.error("sendRealtimeInput error:", e);
-      safeSend(clientWs, { type: "error", message: "Gemini realtime send error: " + e.message });
-    }
-  }
-
-  function sendToGeminiText(text) {
-    const clean = String(text || "").trim().slice(0, 1000);
-    if (!clean) return;
-    if (!geminiReady || !geminiSession) {
-      pendingInputs.push({ kind: "text", payload: clean });
-      return;
-    }
-    try {
-      // Text needs a completed user turn so Gemini answers immediately.
-      if (typeof geminiSession.sendClientContent === "function") {
-        geminiSession.sendClientContent({
-          turns: [{ role: "user", parts: [{ text: clean }] }],
-          turnComplete: true
-        });
-      } else {
-        geminiSession.sendRealtimeInput({ text: clean });
-        geminiSession.sendRealtimeInput({ text: "Please answer now in Yasmin's warm feminine voice." });
-      }
-    } catch (e) {
-      console.error("send text error:", e);
-      safeSend(clientWs, { type: "error", message: "Gemini text send error: " + e.message });
-    }
-  }
-
-  async function flushPending() {
-    const copy = pendingInputs;
-    pendingInputs = [];
-    for (const item of copy) {
-      if (item.kind === "text") sendToGeminiText(item.payload);
-      else sendToGeminiRealtime(item.payload);
-    }
-  }
-
   try {
     geminiSession = await ai.live.connect({
       model: LIVE_MODEL,
       callbacks: {
         onopen: () => {
-          console.log("Gemini Live opened", { model: LIVE_MODEL, voice: GEMINI_VOICE, version: SERVER_VERSION });
+          console.log("Gemini Live opened");
           geminiReady = true;
-          safeSend(clientWs, { type: "ready", model: LIVE_MODEL, voice: GEMINI_VOICE, version: SERVER_VERSION });
-          flushPending();
-
-          // Optional warm greeting so you can instantly confirm the new version is deployed.
-          setTimeout(() => {
-            sendToGeminiText("Start the call with a very short warm feminine greeting as Yasmin. Ask me how I am doing.");
-          }, 600);
+          safeSend(clientWs, { type: "ready", model: LIVE_MODEL, voice: GEMINI_VOICE });
+          for (const msg of pendingMessages) {
+            try { geminiSession.sendRealtimeInput(msg); } catch (e) { console.error("flush send error:", e); }
+          }
+          pendingMessages = [];
         },
         onmessage: handleGeminiMessage,
         onerror: (e) => {
@@ -223,40 +173,40 @@ wss.on("connection", async (clientWs, req) => {
     return;
   }
 
+  function sendToGemini(liveInput) {
+    if (!liveInput) return;
+    if (!geminiReady || !geminiSession) {
+      pendingMessages.push(liveInput);
+      return;
+    }
+    try {
+      geminiSession.sendRealtimeInput(liveInput);
+    } catch (e) {
+      console.error("sendRealtimeInput error:", e);
+      safeSend(clientWs, { type: "error", message: "Gemini send error: " + e.message });
+    }
+  }
+
   clientWs.on("message", (raw) => {
     try {
       const msg = JSON.parse(raw.toString());
 
       if (msg.type === "audio" && msg.data) {
-        hasAudioSinceLastEnd = true;
-        sendToGeminiRealtime({
+        sendToGemini({
           audio: { data: msg.data, mimeType: msg.mimeType || "audio/pcm;rate=16000" }
         });
         return;
       }
 
+      // Important: tells Gemini the user stopped speaking, so it should answer.
       if (msg.type === "audioEnd") {
-        const now = Date.now();
-        // prevent many audioEnd messages from spamming the model
-        if (now - lastAudioEndAt < 900) return;
-        lastAudioEndAt = now;
+        sendToGemini({ audioStreamEnd: true });
         safeSend(clientWs, { type: "heardYou" });
-
-        if (hasAudioSinceLastEnd) {
-          hasAudioSinceLastEnd = false;
-          sendToGeminiRealtime({ audioStreamEnd: true });
-          // Backup nudge: if the audio was too weak/unclear, still get a short feminine response.
-          setTimeout(() => {
-            sendToGeminiText("I just finished speaking. If you heard me, answer naturally as Yasmin in one short feminine sentence. If unclear, ask me to say it again softly.");
-          }, 350);
-        } else {
-          sendToGeminiText("The caller is silent. Say one short warm feminine line inviting him to talk.");
-        }
         return;
       }
 
       if (msg.type === "text" && msg.text) {
-        sendToGeminiText(msg.text);
+        sendToGemini({ text: String(msg.text).slice(0, 1000) });
         return;
       }
     } catch (err) {
@@ -277,8 +227,7 @@ wss.on("connection", async (clientWs, req) => {
 
 server.listen(PORT, () => {
   console.log(`Gold Queen Yasmin call server running on port ${PORT}`);
-  console.log(`Version: ${SERVER_VERSION}`);
   console.log(`WebSocket path: /live`);
   console.log(`Model: ${LIVE_MODEL}`);
-  console.log(`Voice: ${GEMINI_VOICE}`);
+  console.log(`Voice: ${GEMINI_VOICE}`);\n  console.log(`Version: yasmin-young-sweet-spicy-v6`);
 });
