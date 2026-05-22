@@ -1,13 +1,15 @@
 {
-  "name": "goldqueen-yasmin-call",
+  "name": "goldqueen-yasmin-realtime-call",
   "version": "1.0.0",
-  "private": true,
+  "description": "Gold Queen Yasmin real-time Gemini Live call server",
+  "type": "module",
   "main": "server-goldqueen-call.js",
   "scripts": {
     "start": "node server-goldqueen-call.js"
   },
   "dependencies": {
-    "express": "^4.19.2",
-    "ws": "^8.18.0"
+    "@google/genai": "latest",
+    "express": "latest",
+    "ws": "latest"
   }
 }
