@@ -1,5 +1,5 @@
 {
-  "name": "goldqueen-yasmin-realtime-call",
+  "name": "goldqueen-yasmin-call",
   "version": "1.0.0",
   "type": "module",
   "main": "server-goldqueen-call.js",
