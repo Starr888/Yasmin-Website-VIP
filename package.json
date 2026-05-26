@@ -1,7 +1,10 @@
 {
+  "name": "mamax-emotion-mood-server",
+  "version": "1.0.0",
   "type": "module",
+  "main": "server.js",
   "scripts": {
-    "start": "node server-goldqueen-call.js"
+    "start": "node server.js"
   },
   "dependencies": {
     "@google/genai": "latest",
