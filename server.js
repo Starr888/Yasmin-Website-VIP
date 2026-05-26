@@ -1,5 +1,7 @@
 import express from "express";
 import http from "http";
+import fs from "fs";
+import path from "path";
 import { WebSocketServer } from "ws";
 import { GoogleGenAI, Modality } from "@google/genai";
 
@@ -8,6 +10,10 @@ const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const GEMINI_LIVE_MODEL = process.env.GEMINI_LIVE_MODEL || "gemini-3.1-flash-live-preview";
 const BOT_NAME = process.env.BOT_NAME || "Yasmin";
 const BOT_BRAND = process.env.BOT_BRAND || "Gold Queen Live";
+
+// Remember users for 3 days.
+const MEMORY_TTL_MS = 3 * 24 * 60 * 60 * 1000;
+const MEMORY_FILE = process.env.MEMORY_FILE || path.join(process.cwd(), "memory.json");
 
 if (!GEMINI_API_KEY) {
   console.warn("WARNING: GEMINI_API_KEY is missing. Add it in Render Environment.");
@@ -21,7 +27,7 @@ app.get("/", (req, res) => {
 });
 
 app.get("/health", (req, res) => {
-  res.json({ ok: true, model: GEMINI_LIVE_MODEL, bot: BOT_NAME });
+  res.json({ ok: true, model: GEMINI_LIVE_MODEL, bot: BOT_NAME, memoryDays: 3 });
 });
 
 const server = http.createServer(app);
@@ -31,8 +37,54 @@ function safeSend(ws, obj) {
   if (ws.readyState === ws.OPEN) ws.send(JSON.stringify(obj));
 }
 
-function createState() {
+function loadAllMemory() {
+  try {
+    if (!fs.existsSync(MEMORY_FILE)) return {};
+    const raw = fs.readFileSync(MEMORY_FILE, "utf8");
+    if (!raw.trim()) return {};
+    return JSON.parse(raw);
+  } catch (err) {
+    console.warn("Memory load error:", err.message);
+    return {};
+  }
+}
+
+function saveAllMemory(data) {
+  try {
+    fs.writeFileSync(MEMORY_FILE, JSON.stringify(data, null, 2), "utf8");
+  } catch (err) {
+    console.warn("Memory save error:", err.message);
+  }
+}
+
+function cleanupOldMemory(memory) {
+  const now = Date.now();
+  for (const [userId, record] of Object.entries(memory)) {
+    if (!record?.savedAt || now - record.savedAt > MEMORY_TTL_MS) {
+      delete memory[userId];
+    }
+  }
+  return memory;
+}
+
+let persistentMemory = cleanupOldMemory(loadAllMemory());
+saveAllMemory(persistentMemory);
+
+function getUserId(req) {
+  // Best: pass ?uid=USER_ID from your call page later.
+  // Fallback: use IP address, good enough for first version.
+  const url = new URL(req.url || "/live", "http://localhost");
+  const uid = url.searchParams.get("uid");
+  if (uid) return String(uid).replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 64) || "defaultUser";
+
+  const forwarded = req.headers["x-forwarded-for"];
+  const ip = Array.isArray(forwarded) ? forwarded[0] : (forwarded || req.socket.remoteAddress || "defaultUser");
+  return String(ip).split(",")[0].trim().replace(/[^a-zA-Z0-9_.:-]/g, "_").slice(0, 80) || "defaultUser";
+}
+
+function defaultState() {
   return {
+    userName: "baby",
     scene: "livingroom",
     mood: "romantic",
     action: "idle",
@@ -42,6 +94,58 @@ function createState() {
     outfit: "default",
     memory: []
   };
+}
+
+function createState(userId) {
+  const saved = persistentMemory[userId];
+  const now = Date.now();
+
+  if (saved?.state && saved?.savedAt && now - saved.savedAt <= MEMORY_TTL_MS) {
+    return {
+      ...defaultState(),
+      ...saved.state,
+      memory: Array.isArray(saved.state.memory) ? saved.state.memory.slice(-12) : []
+    };
+  }
+
+  return defaultState();
+}
+
+function saveUserState(userId, state) {
+  persistentMemory[userId] = {
+    savedAt: Date.now(),
+    state: {
+      userName: state.userName || "baby",
+      scene: state.scene || "livingroom",
+      mood: state.mood || "romantic",
+      action: state.action || "idle",
+      relationship: state.relationship || "wife",
+      affection: Number(state.affection || 85),
+      excitement: Number(state.excitement || 70),
+      outfit: state.outfit || "default",
+      memory: Array.isArray(state.memory) ? state.memory.slice(-12) : []
+    }
+  };
+
+  persistentMemory = cleanupOldMemory(persistentMemory);
+  saveAllMemory(persistentMemory);
+}
+
+function detectName(text = "") {
+  const patterns = [
+    /\bmy name is\s+([a-zA-Z\u1780-\u17FF\u0E00-\u0E7F\u4E00-\u9FFF][^,.!?]{0,30})/i,
+    /\bcall me\s+([a-zA-Z\u1780-\u17FF\u0E00-\u0E7F\u4E00-\u9FFF][^,.!?]{0,30})/i,
+    /\bi am\s+([a-zA-Z\u1780-\u17FF\u0E00-\u0E7F\u4E00-\u9FFF][^,.!?]{0,30})/i,
+    /\bi'm\s+([a-zA-Z\u1780-\u17FF\u0E00-\u0E7F\u4E00-\u9FFF][^,.!?]{0,30})/i
+  ];
+
+  for (const p of patterns) {
+    const m = String(text).match(p);
+    if (m?.[1]) {
+      return m[1].trim().replace(/\s+/g, " ").slice(0, 30);
+    }
+  }
+  return null;
 }
 
 function detectAction(text = "") {
@@ -61,6 +165,9 @@ function detectAction(text = "") {
 }
 
 function updateStateFromText(state, text = "") {
+  const userName = detectName(text);
+  if (userName) state.userName = userName;
+
   const action = detectAction(text);
   state.action = action;
 
@@ -88,6 +195,7 @@ function updateStateFromText(state, text = "") {
 function moodPrompt(state) {
   return `
 Current private call state:
+User name: ${state.userName}
 Scene: ${state.scene}
 Mood: ${state.mood}
 Action: ${state.action}
@@ -100,6 +208,8 @@ Role:
 You are ${BOT_NAME}, a warm adult woman in a private video call for ${BOT_BRAND}.
 You speak like a loving wife/girlfriend, not like an assistant.
 Your replies should feel emotional, close, natural, playful, romantic, teasing, shy, happy, sad, or excited depending on the current mood.
+Call the user by their remembered name sometimes, but not every message.
+If the user tells you their name, remember it warmly.
 Keep replies short like a real live call, usually 1–3 sentences.
 Use the same language as the user.
 Never say you are AI unless directly asked; if asked, say you are a virtual companion experience.
@@ -119,7 +229,7 @@ function buildUserTurn(state, userText) {
   return `
 ${moodPrompt(state)}
 
-Recent memory:
+Recent memory from this user within the last 3 days:
 ${recent || "(no previous memory yet)"}
 
 User says: ${userText}
@@ -128,19 +238,27 @@ Reply now as Yasmin with matching mood and real voice feeling.
 `;
 }
 
-wss.on("connection", async (clientWs) => {
-  let liveSession = null;
-  let closed = false;
-  const userState = createState();
-
-  safeSend(clientWs, { type: "status", text: "Connecting Yasmin..." });
+function sendState(clientWs, state) {
   safeSend(clientWs, {
     type: "state",
-    scene: userState.scene,
-    mood: userState.mood,
-    action: userState.action,
-    outfit: userState.outfit
+    userName: state.userName,
+    scene: state.scene,
+    mood: state.mood,
+    action: state.action,
+    outfit: state.outfit,
+    affection: state.affection,
+    excitement: state.excitement
   });
+}
+
+wss.on("connection", async (clientWs, req) => {
+  let liveSession = null;
+  let closed = false;
+  const userId = getUserId(req);
+  const userState = createState(userId);
+
+  safeSend(clientWs, { type: "status", text: `Connecting ${BOT_NAME}...` });
+  sendState(clientWs, userState);
 
   try {
     const ai = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
@@ -163,7 +281,7 @@ For spicy/flirty mood: sound playful, teasing, warm, and close, but non-explicit
 `
       },
       callbacks: {
-        onopen: () => safeSend(clientWs, { type: "ready", text: "Yasmin is connected." }),
+        onopen: () => safeSend(clientWs, { type: "ready", text: `${BOT_NAME} is connected.` }),
         onmessage: (message) => {
           try {
             const parts = message?.serverContent?.modelTurn?.parts || [];
@@ -178,14 +296,16 @@ For spicy/flirty mood: sound playful, teasing, warm, and close, but non-explicit
               if (part?.text) {
                 const last = userState.memory[userState.memory.length - 1];
                 if (last && !last.ai) last.ai = part.text;
+                saveUserState(userId, userState);
                 safeSend(clientWs, { type: "text", text: part.text });
               }
             }
             if (message?.serverContent?.turnComplete) {
+              saveUserState(userId, userState);
               safeSend(clientWs, { type: "turnComplete" });
             }
             if (message?.setupComplete) {
-              safeSend(clientWs, { type: "ready", text: "Yasmin is ready. Tap Start Call and speak." });
+              safeSend(clientWs, { type: "ready", text: `${BOT_NAME} is ready. Tap Start Call and speak.` });
             }
           } catch (err) {
             safeSend(clientWs, { type: "error", text: "Message parse error: " + err.message });
@@ -213,13 +333,8 @@ For spicy/flirty mood: sound playful, teasing, warm, and close, but non-explicit
 
       if (msg.type === "control" && msg.action) {
         updateStateFromText(userState, msg.action);
-        safeSend(clientWs, {
-          type: "state",
-          scene: userState.scene,
-          mood: userState.mood,
-          action: userState.action,
-          outfit: userState.outfit
-        });
+        sendState(clientWs, userState);
+        saveUserState(userId, userState);
         return;
       }
 
@@ -230,29 +345,19 @@ For spicy/flirty mood: sound playful, teasing, warm, and close, but non-explicit
       }
 
       if (msg.type === "audioEnd") {
-        safeSend(clientWs, {
-          type: "state",
-          scene: userState.scene,
-          mood: userState.mood,
-          action: userState.action || "talk",
-          outfit: userState.outfit
-        });
+        sendState(clientWs, userState);
+        saveUserState(userId, userState);
       }
 
       if (msg.type === "text" && msg.text) {
         const userText = msg.text.trim();
         updateStateFromText(userState, userText);
 
-        safeSend(clientWs, {
-          type: "state",
-          scene: userState.scene,
-          mood: userState.mood,
-          action: userState.action,
-          outfit: userState.outfit
-        });
+        sendState(clientWs, userState);
 
         userState.memory.push({ user: userText, ai: "" });
         if (userState.memory.length > 12) userState.memory.shift();
+        saveUserState(userId, userState);
 
         liveSession.sendClientContent({
           turns: [{ role: "user", parts: [{ text: buildUserTurn(userState, userText) }] }],
@@ -270,6 +375,7 @@ For spicy/flirty mood: sound playful, teasing, warm, and close, but non-explicit
 
   clientWs.on("close", () => {
     closed = true;
+    saveUserState(userId, userState);
     try { liveSession?.close?.(); } catch {}
   });
 });
@@ -277,4 +383,5 @@ For spicy/flirty mood: sound playful, teasing, warm, and close, but non-explicit
 server.listen(PORT, () => {
   console.log(`Gold Queen Live emotional server running on port ${PORT}`);
   console.log(`WebSocket path: /live`);
+  console.log(`3-day memory file: ${MEMORY_FILE}`);
 });
