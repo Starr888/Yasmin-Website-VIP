@@ -1,9 +1,11 @@
 {
-  "name": "goldqueen-jam-yasmin-call-server",
+  "name": "goldqueen-multi-character-live-call",
   "version": "1.0.0",
   "type": "module",
   "main": "server-goldqueen-call.js",
-  "scripts": { "start": "node server-goldqueen-call.js" },
+  "scripts": {
+    "start": "node server-goldqueen-call.js"
+  },
   "dependencies": {
     "@google/genai": "latest",
     "express": "latest",
