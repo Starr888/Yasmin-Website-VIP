@@ -1,10 +1,10 @@
 {
-  "name": "mamax-memory-fixed-final",
+  "name": "goldqueen-yasmin-jam-live-call",
   "version": "1.0.0",
   "type": "module",
-  "main": "server.js",
+  "main": "server-goldqueen-call.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server-goldqueen-call.js"
   },
   "dependencies": {
     "@google/genai": "latest",
