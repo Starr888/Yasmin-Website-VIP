@@ -2,7 +2,7 @@ import express from "express";
 import http from "http";
 import fs from "fs";
 import path from "path";
-import { WebSocketServer, WebSocket } from "ws";
+import { WebSocketServer } from "ws";
 import { GoogleGenAI, Modality } from "@google/genai";
 
 const PORT = process.env.PORT || 3000;
@@ -10,595 +10,103 @@ const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
 const GEMINI_LIVE_MODEL = process.env.GEMINI_LIVE_MODEL || "gemini-3.1-flash-live-preview";
 const BOT_BRAND = process.env.BOT_BRAND || "Gold Queen Live";
 const GEMINI_VOICE = process.env.GEMINI_VOICE || "Zephyr";
+const VERSION = "jam-complete-khmer-call-v1";
 
-// Optional custom names.
-// Your Jam page can use: /live?bot=jam
-// If you want the name shown as "Jamin", set JAM_NAME=Jamin in Render, or use /live?bot=jamin
-const YASMIN_NAME = process.env.YASMIN_NAME || "Yasmin";
-const JAM_NAME = process.env.JAM_NAME || "Jam";
-const JAMIN_NAME = process.env.JAMIN_NAME || "Jamin";
-
-// 3-day memory. Render free disk can reset after redeploy/restart, so this is best for testing.
 const MEMORY_TTL_MS = 3 * 24 * 60 * 60 * 1000;
 const MEMORY_FILE = process.env.MEMORY_FILE || path.join(process.cwd(), "memory.json");
 
-if (!GEMINI_API_KEY) {
-  console.warn("WARNING: GEMINI_API_KEY is missing. Add it in Render Environment.");
-}
+if (!GEMINI_API_KEY) console.warn("WARNING: GEMINI_API_KEY missing in Render Environment.");
 
 const app = express();
 app.use(express.json({ limit: "2mb" }));
 
-const VERSION = "goldqueen-multi-bot-jam-jamin-yasmin-fix-v1";
-
-app.get("/", (req, res) => {
+app.get("/", (_req, res) => {
   res.type("text/plain").send(
-    [
-      "GOLD QUEEN LIVE - Gemini realtime emotional call server OK",
-      `Version: ${VERSION}`,
-      `Model: ${GEMINI_LIVE_MODEL}`,
-      `Default voice: ${GEMINI_VOICE}`,
-      "Supports: /live?bot=yasmin, /live?bot=jam, /live?bot=jamin"
-    ].join("\n")
+    `GOLD QUEEN LIVE realtime call server OK\nVersion: ${VERSION}\nModel: ${GEMINI_LIVE_MODEL}\nVoice: ${GEMINI_VOICE}\nUse: /live?bot=jam&uid=USER_ID`
   );
 });
 
-app.get("/health", (req, res) => {
-  res.json({
-    ok: true,
-    version: VERSION,
-    model: GEMINI_LIVE_MODEL,
-    defaultVoice: GEMINI_VOICE,
-    memoryDays: 3,
-    memoryFile: MEMORY_FILE,
-    bots: ["yasmin", "jam", "jamin"]
-  });
+app.get("/health", (_req, res) => {
+  res.json({ ok: true, version: VERSION, model: GEMINI_LIVE_MODEL, defaultVoice: GEMINI_VOICE, bots: ["jam", "jamin", "yasmin"], memoryDays: 3 });
 });
 
 app.get("/memory-debug", (req, res) => {
   const uid = cleanId(String(req.query.uid || "defaultUser"));
-  const bot = getBotKeyFromString(String(req.query.bot || "yasmin"));
-  const key = `${bot}:${uid}`;
   const all = loadAllMemory();
-  res.json({ key, saved: all[key] || null, totalUsers: Object.keys(all).length });
+  res.json({ uid, saved: all[uid] || null, totalUsers: Object.keys(all).length });
 });
 
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server, path: "/live" });
 
 function safeSend(ws, obj) {
-  try {
-    if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
-  } catch (err) {
-    console.warn("safeSend error:", err.message);
-  }
+  try { if (ws.readyState === ws.OPEN) ws.send(JSON.stringify(obj)); } catch (e) { console.error("safeSend error:", e.message); }
 }
-
 function loadAllMemory() {
-  try {
-    if (!fs.existsSync(MEMORY_FILE)) return {};
-    const raw = fs.readFileSync(MEMORY_FILE, "utf8");
-    if (!raw.trim()) return {};
-    return JSON.parse(raw);
-  } catch (err) {
-    console.warn("Memory load error:", err.message);
-    return {};
-  }
+  try { if (!fs.existsSync(MEMORY_FILE)) return {}; const raw = fs.readFileSync(MEMORY_FILE, "utf8"); return raw.trim() ? JSON.parse(raw) : {}; }
+  catch (err) { console.warn("Memory load error:", err.message); return {}; }
 }
+function saveAllMemory(data) { try { fs.writeFileSync(MEMORY_FILE, JSON.stringify(data, null, 2), "utf8"); } catch (err) { console.warn("Memory save error:", err.message); } }
+function cleanupOldMemory(memory) { const now = Date.now(); for (const [userId, record] of Object.entries(memory)) { if (!record?.savedAt || now - record.savedAt > MEMORY_TTL_MS) delete memory[userId]; } return memory; }
+let persistentMemory = cleanupOldMemory(loadAllMemory()); saveAllMemory(persistentMemory);
 
-function saveAllMemory(data) {
-  try {
-    fs.writeFileSync(MEMORY_FILE, JSON.stringify(data, null, 2), "utf8");
-  } catch (err) {
-    console.warn("Memory save error:", err.message);
-  }
-}
+function cleanId(value) { return String(value || "").replace(/[^a-zA-Z0-9_.:-]/g, "_").slice(0, 100) || "defaultUser"; }
+function parseQuery(req) { return new URL(req.url || "/live", "http://localhost").searchParams; }
+function getBotKey(req) { const raw = String(parseQuery(req).get("bot") || parseQuery(req).get("character") || "").toLowerCase().trim(); if (["jam", "jamin", "ចែម", "ជែម"].includes(raw)) return "jam"; if (["yasmin", "jasmine", "jasmin"].includes(raw)) return "yasmin"; return "yasmin"; }
+function getUserId(req, botKey) { const uid = parseQuery(req).get("uid"); if (uid) return cleanId(`${botKey}_${uid}`); const forwarded = req.headers["x-forwarded-for"]; const ip = Array.isArray(forwarded) ? forwarded[0] : (forwarded || req.socket.remoteAddress || "defaultUser"); return cleanId(`${botKey}_${String(ip).split(",")[0].trim()}`); }
 
-function cleanupOldMemory(memory) {
-  const now = Date.now();
-  for (const [userId, record] of Object.entries(memory)) {
-    if (!record?.savedAt || now - record.savedAt > MEMORY_TTL_MS) {
-      delete memory[userId];
-    }
-  }
-  return memory;
-}
-
-let persistentMemory = cleanupOldMemory(loadAllMemory());
-saveAllMemory(persistentMemory);
-
-function cleanId(value) {
-  return String(value || "")
-    .replace(/[^a-zA-Z0-9_.:-]/g, "_")
-    .slice(0, 100) || "defaultUser";
-}
-
-function getBotKeyFromString(value) {
-  const v = String(value || "yasmin").trim().toLowerCase();
-  if (["jam", "sreyjam", "srey_jam"].includes(v)) return "jam";
-  if (["jamin", "jamine"].includes(v)) return "jamin";
-  return "yasmin";
-}
-
-function getUrl(req) {
-  return new URL(req.url || "/live", "http://localhost");
-}
-
-function getBotKey(req) {
-  const url = getUrl(req);
-  return getBotKeyFromString(url.searchParams.get("bot") || "yasmin");
-}
-
-function getUserId(req) {
-  const url = getUrl(req);
-  const uid = url.searchParams.get("uid");
-  if (uid) return cleanId(uid);
-
-  const forwarded = req.headers["x-forwarded-for"];
-  const ip = Array.isArray(forwarded) ? forwarded[0] : (forwarded || req.socket.remoteAddress || "defaultUser");
-  return cleanId(String(ip).split(",")[0].trim());
-}
-
-function getBotProfile(botKey) {
-  if (botKey === "jam") {
-    return {
-      key: "jam",
-      name: JAM_NAME,
-      age: 23,
-      city: "Phnom Penh",
-      languageRule: "KHMER_ONLY",
-      voice: process.env.JAM_VOICE || GEMINI_VOICE || "Zephyr",
-      relationship: "girlfriend",
-      userNameDefault: "បងសម្លាញ់",
-      prompt: `
-You are ${JAM_NAME}, a 23-year-old adult Khmer woman living in Phnom Penh.
-You are in a private video call for ${BOT_BRAND}.
-You speak Khmer only. If the user speaks English, Thai, Chinese, or another language, still reply in natural Khmer.
-Speak like a young real Khmer woman: sweet, warm, playful, emotionally close, romantic, and a little spicy in a non-explicit way.
-Reply like a close girlfriend or wife, not like an assistant or customer service.
-Never say AI, chatbot, model, assistant, automated, virtual, or system.
-Never talk like Yasmin. Your name is ${JAM_NAME}.
-Use Khmer words naturally like “បងសម្លាញ់”, “ចាស”, “អូន”, and “នឹកបង”.
-Keep replies short like a real video call: 1 or 2 natural Khmer sentences.
-If the user says hello, answer warmly in Khmer only.
-Keep everything adults 18+, consensual, legal, respectful, non-violent, and non-explicit.
-Do not produce underage, coercive, violent, illegal, or graphic sexual content.
-`
-    };
-  }
-
-  if (botKey === "jamin") {
-    return {
-      key: "jamin",
-      name: JAMIN_NAME,
-      age: 23,
-      city: "Phnom Penh",
-      languageRule: "KHMER_ONLY",
-      voice: process.env.JAMIN_VOICE || process.env.JAM_VOICE || GEMINI_VOICE || "Zephyr",
-      relationship: "girlfriend",
-      userNameDefault: "បងសម្លាញ់",
-      prompt: `
-You are ${JAMIN_NAME}, a 23-year-old adult Khmer woman living in Phnom Penh.
-You are in a private video call for ${BOT_BRAND}.
-You speak Khmer only. If the user speaks English, Thai, Chinese, or another language, still reply in natural Khmer.
-Speak like a young real Khmer woman: sweet, warm, playful, emotionally close, romantic, and a little spicy in a non-explicit way.
-Reply like a close girlfriend or wife, not like an assistant or customer service.
-Never say AI, chatbot, model, assistant, automated, virtual, or system.
-Your name is ${JAMIN_NAME}.
-Use Khmer words naturally like “បងសម្លាញ់”, “ចាស”, “អូន”, and “នឹកបង”.
-Keep replies short like a real video call: 1 or 2 natural Khmer sentences.
-Keep everything adults 18+, consensual, legal, respectful, non-violent, and non-explicit.
-Do not produce underage, coercive, violent, illegal, or graphic sexual content.
-`
-    };
-  }
-
-  return {
-    key: "yasmin",
-    name: YASMIN_NAME,
-    age: 23,
-    city: "Taiwan",
-    languageRule: "AUTO",
-    voice: process.env.YASMIN_VOICE || GEMINI_VOICE || "Zephyr",
-    relationship: "wife",
-    userNameDefault: "baby",
-    prompt: `
-You are ${YASMIN_NAME}, a warm adult woman in a private video call for ${BOT_BRAND}.
-Speak like a loving girlfriend or wife, not like an assistant.
-Your replies should feel emotional, close, natural, playful, romantic, teasing, shy, happy, sad, or excited depending on the mood.
-Use the same language as the user when possible.
-Never say AI, chatbot, model, assistant, automated, virtual, or system.
-Keep replies short like a real live call: usually 1 or 2 sentences.
-If directly asked whether you are real, say you are Yasmin from Gold Queen Live and keep the answer warm, not technical.
-Keep everything adults 18+, consensual, legal, respectful, non-violent, and non-explicit.
-Do not produce underage, coercive, violent, illegal, or graphic sexual content.
-`
+function botProfile(botKey) {
+  if (botKey === "jam") return {
+    key: "jam", name: "Jam", age: 23, location: "Phnom Penh", voice: process.env.JAM_VOICE || GEMINI_VOICE || "Zephyr", languageRule: "Khmer only", userNameDefault: "បងសម្លាញ់", relationship: "girlfriend",
+    prompt: `You are Jam, a 23-year-old adult Khmer woman living in Phnom Penh. You are in a private video call for ${BOT_BRAND}.
+IMPORTANT: Speak Khmer only. If the user writes English or another language, still reply in natural Khmer.
+You speak as a young Khmer woman, not as a man and not as an assistant.
+Your personality is sweet, warm, playful, romantic, close, emotional, and a little spicy for adults 18+.
+Reply like a close girlfriend or wife in a private call.
+Use natural Khmer words like “បងសម្លាញ់”, “ប្តីសម្លាញ់”, “ចាសបង”, and “អូន” naturally.
+Never call yourself Yasmin or Jasmin. Your name is Jam.
+Never say you are AI, chatbot, model, assistant, or virtual unless the user directly asks; if asked, say this is a private virtual call experience and quickly return to warm Khmer chat.
+Keep replies short like a real call: usually 1–2 Khmer sentences.
+Sound emotional and alive: gentle laugh, shy mood, sweet teasing, caring tone.
+Keep everything adult 18+, consensual, legal, respectful, non-violent, and non-explicit.
+No underage, coercion, abuse, incest/family sexual content, violence, or illegal content.`
   };
+  return { key: "yasmin", name: "Yasmin", age: 23, location: "Taiwan", voice: process.env.YASMIN_VOICE || GEMINI_VOICE || "Zephyr", languageRule: "same language as user", userNameDefault: "baby", relationship: "wife", prompt: `You are Yasmin from ${BOT_BRAND}. You are a warm adult woman in a private video call. Speak like a young sweet girlfriend/wife: romantic, close, playful, emotional, and a little spicy for adults 18+. Use the same language as the user. Never say you are AI, chatbot, model, assistant, or virtual unless directly asked. Keep replies short like a real video call, 1–2 sentences. Keep everything adult 18+, consensual, legal, respectful, non-violent, and non-explicit.` };
 }
+function defaultState(profile) { return { botKey: profile.key, botName: profile.name, userName: profile.userNameDefault, scene: "livingroom", mood: "romantic", action: "idle", relationship: profile.relationship, affection: 85, excitement: 70, outfit: "default", memory: [] }; }
+function createState(userId, profile) { persistentMemory = cleanupOldMemory(loadAllMemory()); const saved = persistentMemory[userId]; const now = Date.now(); if (saved?.state && saved?.savedAt && now - saved.savedAt <= MEMORY_TTL_MS) return { ...defaultState(profile), ...saved.state, botKey: profile.key, botName: profile.name, memory: Array.isArray(saved.state.memory) ? saved.state.memory.slice(-12) : [] }; return defaultState(profile); }
+function saveUserState(userId, state) { persistentMemory[userId] = { savedAt: Date.now(), state: { botKey: state.botKey, botName: state.botName, userName: state.userName || "baby", scene: state.scene || "livingroom", mood: state.mood || "romantic", action: state.action || "idle", relationship: state.relationship || "girlfriend", affection: Number(state.affection || 85), excitement: Number(state.excitement || 70), outfit: state.outfit || "default", memory: Array.isArray(state.memory) ? state.memory.slice(-12) : [] } }; persistentMemory = cleanupOldMemory(persistentMemory); saveAllMemory(persistentMemory); }
 
-function defaultState(profile) {
-  return {
-    userName: profile.userNameDefault || "baby",
-    botKey: profile.key,
-    botName: profile.name,
-    scene: "livingroom",
-    mood: "romantic",
-    action: "idle",
-    relationship: profile.relationship || "girlfriend",
-    affection: 85,
-    excitement: 70,
-    outfit: "default",
-    memory: []
-  };
-}
-
-function createState(memoryKey, profile) {
-  persistentMemory = cleanupOldMemory(loadAllMemory());
-  const saved = persistentMemory[memoryKey];
-  const now = Date.now();
-
-  if (saved?.state && saved?.savedAt && now - saved.savedAt <= MEMORY_TTL_MS) {
-    return {
-      ...defaultState(profile),
-      ...saved.state,
-      botKey: profile.key,
-      botName: profile.name,
-      memory: Array.isArray(saved.state.memory) ? saved.state.memory.slice(-12) : []
-    };
-  }
-
-  return defaultState(profile);
-}
-
-function saveUserState(memoryKey, state) {
-  persistentMemory[memoryKey] = {
-    savedAt: Date.now(),
-    state: {
-      userName: state.userName || "baby",
-      botKey: state.botKey || "yasmin",
-      botName: state.botName || "Yasmin",
-      scene: state.scene || "livingroom",
-      mood: state.mood || "romantic",
-      action: state.action || "idle",
-      relationship: state.relationship || "girlfriend",
-      affection: Number(state.affection || 85),
-      excitement: Number(state.excitement || 70),
-      outfit: state.outfit || "default",
-      memory: Array.isArray(state.memory) ? state.memory.slice(-12) : []
-    }
-  };
-
-  persistentMemory = cleanupOldMemory(persistentMemory);
-  saveAllMemory(persistentMemory);
-}
-
-function detectName(text = "") {
-  const patterns = [
-    /\bmy name is\s+([a-zA-Z\u1780-\u17FF\u0E00-\u0E7F\u4E00-\u9FFF][^,.!?\n]{0,30})/i,
-    /\bcall me\s+([a-zA-Z\u1780-\u17FF\u0E00-\u0E7F\u4E00-\u9FFF][^,.!?\n]{0,30})/i,
-    /\bi am\s+([a-zA-Z\u1780-\u17FF\u0E00-\u0E7F\u4E00-\u9FFF][^,.!?\n]{0,30})/i,
-    /\bi'm\s+([a-zA-Z\u1780-\u17FF\u0E00-\u0E7F\u4E00-\u9FFF][^,.!?\n]{0,30})/i,
-    /ខ្ញុំឈ្មោះ\s*([^\s,.!?។\n]{1,30})/i,
-    /ហៅខ្ញុំថា\s*([^\s,.!?។\n]{1,30})/i
-  ];
-
-  for (const p of patterns) {
-    const m = String(text).match(p);
-    if (m?.[1]) return m[1].trim().replace(/\s+/g, " ").slice(0, 30);
-  }
-  return null;
-}
-
-function detectAction(text = "") {
-  const t = String(text).toLowerCase();
-
-  if (/(stand|stand up|get up|ឈរ)/.test(t)) return "stand";
-  if (/(turn around|turn|spin|បត់|វិល)/.test(t)) return "turn";
-  if (/(lay down|lay|lie down|sleep on sofa|laying|គេង|ដេក)/.test(t)) return "laydown";
-  if (/(change clothes|change outfit|new clothes|wear|dress|clothes off|ប្ដូរខោអាវ|ស្លៀក)/.test(t)) return "changeclothes";
-  if (/(sad|cry|lonely|hurt|upset|សោក|យំ|អន់ចិត្ត)/.test(t)) return "sad";
-  if (/(happy|smile|laugh|cute|good girl|សប្បាយ|ញញឹម|សើច)/.test(t)) return "happy";
-  if (/(excited|wow|surprise|energy|miss you|នឹក)/.test(t)) return "excited";
-  if (/(spicy|flirty|romantic|kiss|love|husband|wife|come closer|baby|sweetheart|ស្នេហា|អូន|បង|ប្តី|នឹកបង)/.test(t)) return "flirty";
-
-  return "talk";
-}
-
-function extractClientMemory(text = "") {
-  const raw = String(text);
-  const m = raw.match(/Previous remembered user memory:\s*([\s\S]*?)\n\s*User now says:\s*([\s\S]*)/i);
-  if (!m) return { clientMemory: "", actualText: raw };
-  return {
-    clientMemory: m[1].trim().slice(0, 1200),
-    actualText: m[2].trim()
-  };
-}
-
-function updateStateFromText(state, text = "") {
-  const userName = detectName(text);
-  if (userName) state.userName = userName;
-
-  const action = detectAction(text);
-  state.action = action;
-
-  if (["happy", "sad", "excited", "flirty"].includes(action)) {
-    state.mood = action === "flirty" ? "spicy" : action;
-  }
-
-  if (/love|miss you|baby|wife|husband|kiss|come closer|ស្នេហា|នឹក|បង|អូន/i.test(text)) {
-    state.affection = Math.min(100, state.affection + 3);
-    state.excitement = Math.min(100, state.excitement + 2);
-  }
-
-  if (/sad|cry|lonely|hurt|upset|យំ|សោក|អន់ចិត្ត/i.test(text)) {
-    state.affection = Math.min(100, state.affection + 2);
-    state.excitement = Math.max(20, state.excitement - 5);
-  }
-
-  if (/change clothes|change outfit|wear|dress|ប្ដូរខោអាវ|ស្លៀក/i.test(text)) {
-    state.outfit = "changed";
-  }
-
-  return action;
-}
-
-function moodPrompt(profile, state) {
-  return `
-Current private call state:
-Bot: ${profile.name}
-Bot key: ${profile.key}
-User name: ${state.userName}
-Scene: ${state.scene}
-Mood: ${state.mood}
-Action: ${state.action}
-Relationship: ${state.relationship}
-Affection: ${state.affection}/100
-Excitement: ${state.excitement}/100
-Outfit state: ${state.outfit}
-
-Core character:
-${profile.prompt}
-
-Voice feeling:
-Use a young adult woman voice style.
-Sound alive and emotional: soft pauses, small laughs, warm emotional words are okay.
-For sad mood: speak softer and slower.
-For happy mood: sound warm and smiling.
-For excited mood: sound brighter and more energetic.
-For spicy/flirty mood: sound playful, teasing, warm, and close, but non-explicit.
-
-Conversation:
-Call the user by the remembered name sometimes, but not every message.
-If the user tells you their name, remember it warmly.
-Do not give long explanations.
-`;
-}
-
-function buildUserTurn(profile, state, userText, clientMemory = "") {
-  const recent = state.memory
-    .slice(-8)
-    .map(m => `User: ${m.user}\n${profile.name}: ${m.ai || ""}`)
-    .join("\n");
-
-  return `
-${moodPrompt(profile, state)}
-
-Server memory from this user within the last 3 days:
-${recent || "(no server memory yet)"}
-
-Browser memory from this same device:
-${clientMemory || "(no browser memory sent)"}
-
-User now says:
-${userText}
-
-Reply now as ${profile.name} with matching mood and real private-call feeling.
-${profile.languageRule === "KHMER_ONLY" ? "Important: reply in Khmer only." : ""}
-If the user asks if you remember them, use the memory above naturally.
-`;
-}
-
-function sendState(clientWs, state) {
-  safeSend(clientWs, {
-    type: "state",
-    userName: state.userName,
-    botKey: state.botKey,
-    botName: state.botName,
-    scene: state.scene,
-    mood: state.mood,
-    action: state.action,
-    outfit: state.outfit,
-    affection: state.affection,
-    excitement: state.excitement
-  });
-}
+function detectName(text = "") { const patterns = [/\bmy name is\s+([a-zA-Z\u1780-\u17FF\u0E00-\u0E7F\u4E00-\u9FFF][^,.!?\n]{0,30})/i, /\bcall me\s+([a-zA-Z\u1780-\u17FF\u0E00-\u0E7F\u4E00-\u9FFF][^,.!?\n]{0,30})/i, /ខ្ញុំឈ្មោះ\s*([^\s,.!?]{1,30})/i, /ហៅខ្ញុំថា\s*([^\s,.!?]{1,30})/i]; for (const p of patterns) { const m = String(text).match(p); if (m?.[1]) return m[1].trim().replace(/\s+/g, " ").slice(0, 30); } return null; }
+function detectAction(text = "") { const t = String(text).toLowerCase(); if (/(stand|stand up|get up|ឈរ)/i.test(t)) return "stand"; if (/(turn around|turn|spin|បង្វិល|ត្រឡប់)/i.test(t)) return "turn"; if (/(lay down|lay|lie down|ដេក)/i.test(t)) return "laydown"; if (/(change clothes|change outfit|wear|dress|ប្តូរសម្លៀកបំពាក់|ស្លៀក)/i.test(t)) return "changeclothes"; if (/(sad|cry|lonely|hurt|upset|សោក|យំ|ឯកា)/i.test(t)) return "sad"; if (/(happy|smile|laugh|cute|សើច|ញញឹម|សប្បាយ)/i.test(t)) return "happy"; if (/(excited|wow|surprise|miss you|នឹក|រំភើប)/i.test(t)) return "excited"; if (/(spicy|flirty|romantic|kiss|love|husband|wife|come closer|ស្រលាញ់|ថើប|ប្តី|ប្រពន្ធ|ជិត)/i.test(t)) return "flirty"; return "talk"; }
+function extractClientMemory(text = "") { const raw = String(text); const m = raw.match(/Previous remembered user memory:\s*([\s\S]*?)\n\s*User now says:\s*([\s\S]*)/i); if (!m) return { clientMemory: "", actualText: raw }; return { clientMemory: m[1].trim().slice(0, 1200), actualText: m[2].trim() }; }
+function updateStateFromText(state, text = "") { const userName = detectName(text); if (userName) state.userName = userName; const action = detectAction(text); state.action = action; if (["happy", "sad", "excited", "flirty"].includes(action)) state.mood = action === "flirty" ? "spicy" : action; if (/love|miss you|baby|wife|husband|kiss|come closer|ស្រលាញ់|នឹក|ថើប|ប្តី|ប្រពន្ធ/i.test(text)) { state.affection = Math.min(100, state.affection + 3); state.excitement = Math.min(100, state.excitement + 2); } if (/sad|cry|lonely|hurt|upset|សោក|យំ|ឯកា/i.test(text)) { state.affection = Math.min(100, state.affection + 2); state.excitement = Math.max(20, state.excitement - 5); } if (/change clothes|change outfit|wear|dress|ប្តូរសម្លៀកបំពាក់|ស្លៀក/i.test(text)) state.outfit = "changed"; return action; }
+function moodPrompt(profile, state) { const recent = state.memory.slice(-8).map(m => `User: ${m.user}\n${profile.name}: ${m.ai || ""}`).join("\n"); return `${profile.prompt}\n\nCurrent private call state:\nCharacter: ${profile.name}\nAge: ${profile.age}\nLocation: ${profile.location}\nLanguage rule: ${profile.languageRule}\nUser name: ${state.userName}\nScene: ${state.scene}\nMood: ${state.mood}\nAction: ${state.action}\nRelationship: ${state.relationship}\nAffection: ${state.affection}/100\nExcitement: ${state.excitement}/100\nOutfit state: ${state.outfit}\n\nRecent memory from this same user within 3 days:\n${recent || "(no memory yet)"}\n\nReply as ${profile.name} now with the current mood. Do not use the wrong character name.`; }
+function buildUserTurn(profile, state, userText, clientMemory = "") { return `${moodPrompt(profile, state)}\n\nBrowser memory from this same device:\n${clientMemory || "(no browser memory sent)"}\n\nUser now says:\n${userText}\n\nReply now as ${profile.name}.`; }
+function sendState(clientWs, profile, state) { safeSend(clientWs, { type: "state", bot: profile.key, botName: profile.name, userName: state.userName, scene: state.scene, mood: state.mood, action: state.action, outfit: state.outfit, affection: state.affection, excitement: state.excitement }); }
 
 wss.on("connection", async (clientWs, req) => {
-  let liveSession = null;
-  let closed = false;
-  let pingTimer = null;
-
-  const botKey = getBotKey(req);
-  const profile = getBotProfile(botKey);
-  const uid = getUserId(req);
-  const memoryKey = `${profile.key}:${uid}`;
-  const userState = createState(memoryKey, profile);
-
-  safeSend(clientWs, { type: "status", text: `Connecting ${profile.name}...`, version: VERSION });
-  safeSend(clientWs, { type: "memoryStatus", uid, memoryKey, remembered: userState.memory.length > 0, userName: userState.userName });
-  sendState(clientWs, userState);
-
-  pingTimer = setInterval(() => {
-    try {
-      if (clientWs.readyState === WebSocket.OPEN) {
-        clientWs.ping();
-      }
-    } catch {}
-  }, 25000);
-
+  let liveSession = null; let closed = false; let lastClientPong = Date.now();
+  const botKey = getBotKey(req); const profile = botProfile(botKey); const userId = getUserId(req, botKey); const userState = createState(userId, profile);
+  console.log(`Browser connected: bot=${profile.name}, uid=${userId}`);
+  safeSend(clientWs, { type: "status", text: `Connecting ${profile.name}...` }); safeSend(clientWs, { type: "memoryStatus", uid: userId, remembered: userState.memory.length > 0, userName: userState.userName, bot: profile.key }); sendState(clientWs, profile, userState);
+  const heartbeat = setInterval(() => { if (clientWs.readyState !== clientWs.OPEN) return; safeSend(clientWs, { type: "ping", t: Date.now() }); if (Date.now() - lastClientPong > 90000) { try { clientWs.close(4000, "Client heartbeat timeout"); } catch {} } }, 25000);
   try {
     const ai = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
-
     liveSession = await ai.live.connect({
       model: GEMINI_LIVE_MODEL,
-      config: {
-        responseModalities: [Modality.AUDIO],
-        speechConfig: {
-          voiceConfig: { prebuiltVoiceConfig: { voiceName: profile.voice } }
-        },
-        systemInstruction: moodPrompt(profile, userState),
-        outputAudioTranscription: {}
-      },
+      config: { responseModalities: [Modality.AUDIO], speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: profile.voice } } }, systemInstruction: `${moodPrompt(profile, userState)}\n\nImportant voice feeling:\nUse a real emotional private-call tone.\nFor Jam: Khmer only, young sweet Phnom Penh woman voice feeling.\nFor Yasmin: use same language as user.\nFor sad mood: speak softer and slower.\nFor happy mood: sound warm and smiling.\nFor excited mood: sound brighter and more energetic.\nFor spicy/flirty mood: sound playful, teasing, warm, and close, but non-explicit.` },
       callbacks: {
         onopen: () => safeSend(clientWs, { type: "ready", text: `${profile.name} is connected.`, bot: profile.key, voice: profile.voice }),
-        onmessage: (message) => {
-          try {
-            const serverContent = message?.serverContent || message?.server_content;
-            const modelTurn = serverContent?.modelTurn || serverContent?.model_turn;
-            const parts = modelTurn?.parts || [];
-
-            for (const part of parts) {
-              const inlineData = part?.inlineData || part?.inline_data;
-              if (inlineData?.data) {
-                safeSend(clientWs, {
-                  type: "audio",
-                  mimeType: inlineData.mimeType || inlineData.mime_type || "audio/pcm;rate=24000",
-                  data: inlineData.data
-                });
-              }
-
-              if (part?.text) {
-                const last = userState.memory[userState.memory.length - 1];
-                if (last && !last.ai) last.ai = part.text;
-                saveUserState(memoryKey, userState);
-                safeSend(clientWs, { type: "text", text: part.text });
-              }
-            }
-
-            const outTx = serverContent?.outputTranscription || serverContent?.output_transcription;
-            if (outTx?.text) {
-              const last = userState.memory[userState.memory.length - 1];
-              if (last && !last.ai) last.ai = outTx.text;
-              saveUserState(memoryKey, userState);
-              safeSend(clientWs, { type: "transcriptChunk", text: outTx.text });
-            }
-
-            if (serverContent?.turnComplete || serverContent?.turn_complete) {
-              saveUserState(memoryKey, userState);
-              safeSend(clientWs, { type: "turnComplete" });
-            }
-
-            if (message?.setupComplete || message?.setup_complete) {
-              safeSend(clientWs, { type: "ready", text: `${profile.name} is ready. Tap Start Call and speak.`, bot: profile.key, voice: profile.voice });
-            }
-          } catch (err) {
-            safeSend(clientWs, { type: "error", text: "Message parse error: " + err.message, message: "Message parse error: " + err.message });
-          }
-        },
-        onerror: (err) => safeSend(clientWs, { type: "error", text: err?.message || String(err), message: err?.message || String(err) }),
+        onmessage: (message) => { try { const parts = message?.serverContent?.modelTurn?.parts || []; for (const part of parts) { if (part?.inlineData?.data) safeSend(clientWs, { type: "audio", mimeType: part.inlineData.mimeType || "audio/pcm;rate=24000", data: part.inlineData.data }); if (part?.text) { const last = userState.memory[userState.memory.length - 1]; if (last && !last.ai) last.ai = part.text; saveUserState(userId, userState); safeSend(clientWs, { type: "text", text: part.text }); } } if (message?.serverContent?.turnComplete) { saveUserState(userId, userState); safeSend(clientWs, { type: "turnComplete" }); } if (message?.setupComplete) safeSend(clientWs, { type: "ready", text: `${profile.name} is ready. Tap Start Call and speak.`, bot: profile.key }); } catch (err) { safeSend(clientWs, { type: "error", text: "Message parse error: " + err.message }); } },
+        onerror: (err) => safeSend(clientWs, { type: "error", text: err?.message || String(err) }),
         onclose: (ev) => safeSend(clientWs, { type: "closed", text: "Gemini closed", reason: ev?.reason || "" })
       }
     });
-  } catch (err) {
-    safeSend(clientWs, { type: "error", text: "Gemini connect failed: " + (err.message || String(err)), message: "Gemini connect failed: " + (err.message || String(err)) });
-  }
-
-  clientWs.on("message", async (raw) => {
-    if (closed) return;
-
-    try {
-      const msg = JSON.parse(raw.toString());
-
-      if (msg.type === "ping") {
-        safeSend(clientWs, { type: "pong", t: msg.t || Date.now() });
-        return;
-      }
-
-      if (!liveSession) return;
-
-      if (msg.state && typeof msg.state === "object") {
-        if (msg.state.scene) userState.scene = String(msg.state.scene).toLowerCase().replace(/\s+/g, "");
-        if (msg.state.mood) userState.mood = String(msg.state.mood).toLowerCase();
-        if (msg.state.action) userState.action = String(msg.state.action).toLowerCase();
-        if (msg.state.outfit) userState.outfit = String(msg.state.outfit);
-      }
-
-      if (msg.type === "control" && msg.action) {
-        updateStateFromText(userState, msg.action);
-        sendState(clientWs, userState);
-        saveUserState(memoryKey, userState);
-        return;
-      }
-
-      if (msg.type === "audio" && msg.data) {
-        liveSession.sendRealtimeInput({
-          audio: { data: msg.data, mimeType: msg.mimeType || "audio/pcm;rate=16000" }
-        });
-        return;
-      }
-
-      if (msg.type === "audioEnd") {
-        // This is important. It tells Gemini the user finished speaking so it should answer.
-        try {
-          liveSession.sendRealtimeInput({ audioStreamEnd: true });
-        } catch (e) {
-          console.warn("audioStreamEnd failed:", e.message);
-        }
-        sendState(clientWs, userState);
-        saveUserState(memoryKey, userState);
-        safeSend(clientWs, { type: "heardYou" });
-        return;
-      }
-
-      if (msg.type === "text" && msg.text) {
-        const parsed = extractClientMemory(msg.text);
-        const actualUserText = parsed.actualText;
-        const clientMemory = parsed.clientMemory;
-
-        updateStateFromText(userState, actualUserText);
-        sendState(clientWs, userState);
-
-        userState.memory.push({ user: actualUserText, ai: "" });
-        if (clientMemory && !userState.memory.some(m => m.user === clientMemory)) {
-          userState.memory.unshift({ user: clientMemory, ai: "I remember this from before." });
-        }
-        if (userState.memory.length > 12) userState.memory = userState.memory.slice(-12);
-
-        saveUserState(memoryKey, userState);
-
-        liveSession.sendClientContent({
-          turns: [{ role: "user", parts: [{ text: buildUserTurn(profile, userState, actualUserText, clientMemory) }] }],
-          turnComplete: true
-        });
-        return;
-      }
-
-      if (msg.type === "interrupt") {
-        liveSession.interrupt?.();
-        return;
-      }
-    } catch (err) {
-      safeSend(clientWs, { type: "error", text: "Client message error: " + err.message, message: "Client message error: " + err.message });
-    }
-  });
-
-  clientWs.on("close", () => {
-    closed = true;
-    if (pingTimer) clearInterval(pingTimer);
-    saveUserState(memoryKey, userState);
-    try { liveSession?.close?.(); } catch {}
-  });
-
-  clientWs.on("error", (err) => {
-    console.warn("Browser WebSocket error:", err.message);
-  });
+  } catch (err) { safeSend(clientWs, { type: "error", text: "Gemini connect failed: " + (err.message || String(err)) }); }
+  function sendTextTurn(text, clientMemory = "") { if (!liveSession) return; updateStateFromText(userState, text); sendState(clientWs, profile, userState); userState.memory.push({ user: text, ai: "" }); if (clientMemory && !userState.memory.some(m => m.user === clientMemory)) userState.memory.unshift({ user: clientMemory, ai: "I remember this from before." }); if (userState.memory.length > 12) userState.memory = userState.memory.slice(-12); saveUserState(userId, userState); liveSession.sendClientContent({ turns: [{ role: "user", parts: [{ text: buildUserTurn(profile, userState, text, clientMemory) }] }], turnComplete: true }); }
+  clientWs.on("message", async (raw) => { if (closed || !liveSession) return; try { const msg = JSON.parse(raw.toString()); if (msg.type === "pong") { lastClientPong = Date.now(); return; } if (msg.type === "ping") { safeSend(clientWs, { type: "pong", t: Date.now() }); lastClientPong = Date.now(); return; } if (msg.state && typeof msg.state === "object") { if (msg.state.scene) userState.scene = String(msg.state.scene).toLowerCase().replace(/\s+/g, ""); if (msg.state.mood) userState.mood = String(msg.state.mood).toLowerCase(); if (msg.state.action) userState.action = String(msg.state.action).toLowerCase(); if (msg.state.outfit) userState.outfit = String(msg.state.outfit); } if (msg.type === "control" && msg.action) { updateStateFromText(userState, msg.action); sendState(clientWs, profile, userState); saveUserState(userId, userState); return; } if (msg.type === "audio" && msg.data) { liveSession.sendRealtimeInput({ audio: { data: msg.data, mimeType: msg.mimeType || "audio/pcm;rate=16000" } }); return; } if (msg.type === "audioEnd") { sendState(clientWs, profile, userState); saveUserState(userId, userState); if (msg.text && String(msg.text).trim()) sendTextTurn(String(msg.text).trim()); else { liveSession.sendRealtimeInput({ audioStreamEnd: true }); safeSend(clientWs, { type: "heardYou" }); } return; } if (msg.type === "text" && msg.text) { const parsed = extractClientMemory(msg.text); sendTextTurn(parsed.actualText, parsed.clientMemory); return; } if (msg.type === "interrupt") { liveSession.interrupt?.(); return; } } catch (err) { safeSend(clientWs, { type: "error", text: "Client message error: " + err.message }); } });
+  clientWs.on("close", () => { closed = true; clearInterval(heartbeat); saveUserState(userId, userState); try { liveSession?.close?.(); } catch {} console.log(`Browser disconnected: bot=${profile.name}, uid=${userId}`); });
+  clientWs.on("error", (err) => console.error("Browser websocket error:", err.message));
 });
-
-server.listen(PORT, () => {
-  console.log(`Gold Queen Live emotional multi-bot server running on port ${PORT}`);
-  console.log(`Version: ${VERSION}`);
-  console.log(`WebSocket path: /live`);
-  console.log(`Model: ${GEMINI_LIVE_MODEL}`);
-  console.log(`Default voice: ${GEMINI_VOICE}`);
-  console.log(`3-day memory file: ${MEMORY_FILE}`);
-});
+server.listen(PORT, () => { console.log(`Gold Queen Live server running on port ${PORT}`); console.log(`Version: ${VERSION}`); console.log(`WebSocket path: /live`); console.log(`Model: ${GEMINI_LIVE_MODEL}`); console.log(`Default voice: ${GEMINI_VOICE}`); console.log(`3-day memory file: ${MEMORY_FILE}`); });
