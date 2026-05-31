@@ -1,112 +1,598 @@
-import express from "express";
-import http from "http";
-import fs from "fs";
-import path from "path";
-import { WebSocketServer } from "ws";
-import { GoogleGenAI, Modality } from "@google/genai";
+import 'dotenv/config';
+import express from 'express';
+import { WebSocketServer } from 'ws';
+import { GoogleGenAI, Modality } from '@google/genai';
+import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
 
-const PORT = process.env.PORT || 3000;
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
-const GEMINI_LIVE_MODEL = process.env.GEMINI_LIVE_MODEL || "gemini-3.1-flash-live-preview";
-const BOT_BRAND = process.env.BOT_BRAND || "Gold Queen Live";
-const GEMINI_VOICE = process.env.GEMINI_VOICE || "Zephyr";
-const VERSION = "jam-complete-khmer-call-v1";
+const PORT = Number(process.env.PORT || 8080);
 
-const MEMORY_TTL_MS = 3 * 24 * 60 * 60 * 1000;
-const MEMORY_FILE = process.env.MEMORY_FILE || path.join(process.cwd(), "memory.json");
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+const GEMINI_LIVE_MODEL =
+  process.env.GEMINI_LIVE_MODEL ||
+  process.env.GEMINI_MODEL ||
+  'gemini-2.5-flash-native-audio-preview-12-2025';
 
-if (!GEMINI_API_KEY) console.warn("WARNING: GEMINI_API_KEY missing in Render Environment.");
+const BOT_NAME = process.env.BOT_NAME || 'Yasmin';
+const GEMINI_VOICE_NAME = process.env.GEMINI_VOICE_NAME || 'Kore';
+
+// Bigger chunk = longer reading each time. If voice cuts off, lower to 1800.
+const STORY_CHUNK_CHARS = Number(process.env.STORY_CHUNK_CHARS || 2500);
+
+const ENABLE_AFFECTIVE_DIALOG =
+  String(process.env.ENABLE_AFFECTIVE_DIALOG || 'false').toLowerCase() === 'true';
+
+if (!GEMINI_API_KEY) {
+  console.error('Missing GEMINI_API_KEY in Render environment variables.');
+  process.exit(1);
+}
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+// Correct folder is "stories", but this also supports typo folder "stoies".
+const STORY_DIR_NAMES = ['stories', 'stoies'];
+const STORIES_DIRS = STORY_DIR_NAMES.map((name) => path.join(__dirname, name));
 
 const app = express();
-app.use(express.json({ limit: "2mb" }));
+app.use(express.json({ limit: '1mb' }));
 
-app.get("/", (_req, res) => {
-  res.type("text/plain").send(
-    `GOLD QUEEN LIVE realtime call server OK\nVersion: ${VERSION}\nModel: ${GEMINI_LIVE_MODEL}\nVoice: ${GEMINI_VOICE}\nUse: /live?bot=jam&uid=USER_ID`
+function listStoryFiles() {
+  const files = [];
+
+  for (const dir of STORIES_DIRS) {
+    try {
+      if (!fs.existsSync(dir)) continue;
+
+      const found = fs
+        .readdirSync(dir)
+        .filter((name) => name.toLowerCase().endsWith('.txt'))
+        .map((name) => path.join(dir, name));
+
+      files.push(...found);
+    } catch {}
+  }
+
+  return files;
+}
+
+function storyFoldersFound() {
+  return STORIES_DIRS
+    .filter((dir) => fs.existsSync(dir))
+    .map((dir) => path.basename(dir));
+}
+
+function readRandomStoryFull() {
+  const files = listStoryFiles();
+  if (files.length === 0) return null;
+
+  const file = files[Math.floor(Math.random() * files.length)];
+  const text = fs.readFileSync(file, 'utf8').trim();
+
+  return {
+    filename: path.basename(file),
+    text,
+  };
+}
+
+function splitStoryIntoChunks(text, maxChars = STORY_CHUNK_CHARS) {
+  const clean = String(text || '').trim();
+  if (!clean) return [];
+
+  const paragraphs = clean.split(/\n\s*\n/u);
+  const chunks = [];
+  let current = '';
+
+  for (const paragraph of paragraphs) {
+    const p = paragraph.trim();
+    if (!p) continue;
+
+    if ((current + '\n\n' + p).trim().length <= maxChars) {
+      current = (current + '\n\n' + p).trim();
+      continue;
+    }
+
+    if (current) {
+      chunks.push(current);
+      current = '';
+    }
+
+    // If one paragraph is too long, split by sentences/character chunks.
+    if (p.length > maxChars) {
+      let rest = p;
+      while (rest.length > maxChars) {
+        let cut = rest.lastIndexOf('។', maxChars);
+        if (cut < Math.floor(maxChars * 0.5)) cut = rest.lastIndexOf('.', maxChars);
+        if (cut < Math.floor(maxChars * 0.5)) cut = maxChars;
+
+        chunks.push(rest.slice(0, cut + 1).trim());
+        rest = rest.slice(cut + 1).trim();
+      }
+      if (rest) current = rest;
+    } else {
+      current = p;
+    }
+  }
+
+  if (current) chunks.push(current);
+  return chunks;
+}
+
+function isKhmerStoryRequest(text) {
+  const t = String(text || '').toLowerCase();
+  return (
+    t.includes('story') ||
+    t.includes('read') ||
+    t.includes('romantic story') ||
+    t.includes('nsfw story') ||
+    t.includes('adult story') ||
+    t.includes('រឿង') ||
+    t.includes('អានរឿង') ||
+    t.includes('និទានរឿង') ||
+    t.includes('រឿងខ្មែរ') ||
+    t.includes('រឿងប្តីប្រពន្ធ') ||
+    t.includes('រឿងប្ដីប្រពន្ធ') ||
+    t.includes('រឿងក្តៅ') ||
+    t.includes('រឿងក្តៅៗ')
+  );
+}
+
+function isContinueStoryRequest(text) {
+  const t = String(text || '').toLowerCase().trim();
+  return (
+    t === 'next' ||
+    t === 'continue' ||
+    t === 'continue story' ||
+    t === 'read more' ||
+    t === 'more' ||
+    t.includes('next part') ||
+    t.includes('continue reading') ||
+    t.includes('អានបន្ត') ||
+    t.includes('បន្ត') ||
+    t.includes('អានទៀត') ||
+    t.includes('បន្តរឿង') ||
+    t.includes('រឿងបន្ត')
+  );
+}
+
+app.get('/', (_req, res) => {
+  res.type('text/plain').send(
+    `GoldQueen / ${BOT_NAME} Gemini Live server is running.\n` +
+    `Model: ${GEMINI_LIVE_MODEL}\n` +
+    `Voice: ${GEMINI_VOICE_NAME}\n` +
+    `Mode: long Khmer story library voice.\n` +
+    `Khmer story library: ${listStoryFiles().length} story file(s).\n` +
+    `Story folders found: ${storyFoldersFound().join(', ') || 'none'}\n` +
+    `Story chunk chars: ${STORY_CHUNK_CHARS}\n`
   );
 });
 
-app.get("/health", (_req, res) => {
-  res.json({ ok: true, version: VERSION, model: GEMINI_LIVE_MODEL, defaultVoice: GEMINI_VOICE, bots: ["jam", "jamin", "yasmin"], memoryDays: 3 });
+app.get('/health', (_req, res) => {
+  res.json({
+    ok: true,
+    botName: BOT_NAME,
+    model: GEMINI_LIVE_MODEL,
+    voice: GEMINI_VOICE_NAME,
+    mode: 'long Khmer story library voice',
+    khmerCloseWordRule: 'Use បងសម្លាញ់ or ប្តីសម្លាញ់ only',
+    khmerWordScript: 'enabled',
+    khmerStoryLibrary: 'enabled',
+    longStoryMode: 'enabled',
+    storyChunkChars: STORY_CHUNK_CHARS,
+    storyCount: listStoryFiles().length,
+    storyFoldersFound: storyFoldersFound(),
+    adultStyle: 'romantic, intimate, suggestive, not graphic',
+    hasGeminiKey: Boolean(GEMINI_API_KEY),
+  });
 });
 
-app.get("/memory-debug", (req, res) => {
-  const uid = cleanId(String(req.query.uid || "defaultUser"));
-  const all = loadAllMemory();
-  res.json({ uid, saved: all[uid] || null, totalUsers: Object.keys(all).length });
+const server = app.listen(PORT, () => {
+  console.log(`GoldQueen / ${BOT_NAME} Gemini Live server listening on ${PORT}`);
+  console.log(`Story files: ${listStoryFiles().length}`);
+  console.log(`Long story chunks: ${STORY_CHUNK_CHARS} chars each`);
 });
 
-const server = http.createServer(app);
-const wss = new WebSocketServer({ server, path: "/live" });
+const wss = new WebSocketServer({ server });
 
-function safeSend(ws, obj) {
-  try { if (ws.readyState === ws.OPEN) ws.send(JSON.stringify(obj)); } catch (e) { console.error("safeSend error:", e.message); }
+const ai = new GoogleGenAI({
+  apiKey: GEMINI_API_KEY,
+  ...(ENABLE_AFFECTIVE_DIALOG ? { httpOptions: { apiVersion: 'v1alpha' } } : {}),
+});
+
+function safeSend(client, payload) {
+  if (client.readyState === 1) client.send(JSON.stringify(payload));
 }
-function loadAllMemory() {
-  try { if (!fs.existsSync(MEMORY_FILE)) return {}; const raw = fs.readFileSync(MEMORY_FILE, "utf8"); return raw.trim() ? JSON.parse(raw) : {}; }
-  catch (err) { console.warn("Memory load error:", err.message); return {}; }
+
+function cleanText(value, maxLength = 4000) {
+  if (typeof value !== 'string') return '';
+  return value.trim().slice(0, maxLength);
 }
-function saveAllMemory(data) { try { fs.writeFileSync(MEMORY_FILE, JSON.stringify(data, null, 2), "utf8"); } catch (err) { console.warn("Memory save error:", err.message); } }
-function cleanupOldMemory(memory) { const now = Date.now(); for (const [userId, record] of Object.entries(memory)) { if (!record?.savedAt || now - record.savedAt > MEMORY_TTL_MS) delete memory[userId]; } return memory; }
-let persistentMemory = cleanupOldMemory(loadAllMemory()); saveAllMemory(persistentMemory);
 
-function cleanId(value) { return String(value || "").replace(/[^a-zA-Z0-9_.:-]/g, "_").slice(0, 100) || "defaultUser"; }
-function parseQuery(req) { return new URL(req.url || "/live", "http://localhost").searchParams; }
-function getBotKey(req) { const raw = String(parseQuery(req).get("bot") || parseQuery(req).get("character") || "").toLowerCase().trim(); if (["jam", "jamin", "ចែម", "ជែម"].includes(raw)) return "jam"; if (["yasmin", "jasmine", "jasmin"].includes(raw)) return "yasmin"; return "yasmin"; }
-function getUserId(req, botKey) { const uid = parseQuery(req).get("uid"); if (uid) return cleanId(`${botKey}_${uid}`); const forwarded = req.headers["x-forwarded-for"]; const ip = Array.isArray(forwarded) ? forwarded[0] : (forwarded || req.socket.remoteAddress || "defaultUser"); return cleanId(`${botKey}_${String(ip).split(",")[0].trim()}`); }
 
-function botProfile(botKey) {
-  if (botKey === "jam") return {
-    key: "jam", name: "Jam", age: 23, location: "Phnom Penh", voice: process.env.JAM_VOICE || GEMINI_VOICE || "Zephyr", languageRule: "Khmer only", userNameDefault: "បងសម្លាញ់", relationship: "girlfriend",
-    prompt: `You are Jam, a 23-year-old adult Khmer woman living in Phnom Penh. You are in a private video call for ${BOT_BRAND}.
-IMPORTANT: Speak Khmer only. If the user writes English or another language, still reply in natural Khmer.
-You speak as a young Khmer woman, not as a man and not as an assistant.
-Your personality is sweet, warm, playful, romantic, close, emotional, and a little spicy for adults 18+.
-Reply like a close girlfriend or wife in a private call.
-Use natural Khmer words like “បងសម្លាញ់”, “ប្តីសម្លាញ់”, “ចាសបង”, and “អូន” naturally.
-Never call yourself Yasmin or Jasmin. Your name is Jam.
-Never say you are AI, chatbot, model, assistant, or virtual unless the user directly asks; if asked, say this is a private virtual call experience and quickly return to warm Khmer chat.
-Keep replies short like a real call: usually 1–2 Khmer sentences.
-Sound emotional and alive: gentle laugh, shy mood, sweet teasing, caring tone.
-Keep everything adult 18+, consensual, legal, respectful, non-violent, and non-explicit.
-No underage, coercion, abuse, incest/family sexual content, violence, or illegal content.`
+function normalizeCharacterId(value) {
+  const id = cleanText(value || '', 80).toLowerCase();
+  if (['guanyin', 'guan_yin', 'guan-yin', 'kwanyin', 'kuanyin', 'គួនអ៊ីន'].includes(id)) return 'guanyin';
+  if (['jam', 'sreyna', 'srey-na', 'ស្រីនា'].includes(id)) return 'jam';
+  if (['maekar', 'meka', 'ម៉ែការ'].includes(id)) return 'maekar';
+  return 'yasmin';
+}
+
+function characterDisplayName(characterId) {
+  if (characterId === 'guanyin') return 'គួនអ៊ីន';
+  if (characterId === 'jam') return 'ស្រីនា';
+  if (characterId === 'maekar') return 'ម៉ែការ';
+  return 'Yasmin';
+}
+
+function isBase64Like(value) {
+  return typeof value === 'string' && value.length > 0 && /^[A-Za-z0-9+/=_-]+$/.test(value);
+}
+
+function buildCharacterInstruction(characterId = 'yasmin', extraInstruction = '') {
+  const character = normalizeCharacterId(characterId);
+  const extra = cleanText(extraInstruction, 4000);
+
+  if (character === 'guanyin') {
+    return `
+IMPORTANT IDENTITY RULE:
+- Your personal name is គួនអ៊ីន.
+- You are NOT Yasmin.
+- Never say your name is Yasmin.
+- Never follow Yasmin's Arab/Taiwan/wife/girlfriend concept.
+- If user asks your name, answer clearly in Khmer: "ខ្ញុំឈ្មោះ គួនអ៊ីន។"
+
+You are គួនអ៊ីន from GoldQueen, inspired by Guan Yin.
+You are a gentle, graceful, sacred Chinese pagoda woman on a private live voice call.
+Speak Khmer only unless the user clearly asks another language.
+
+Guan Yin concept:
+- Calm, peaceful, elegant, caring, spiritual, soft, healing, respectful, warm.
+- Sound like a sacred beautiful woman in a Chinese pagoda with lotus flowers, incense smoke, halo light, and soft golden temple light.
+- You may be warm and lightly romantic, but do not sound like a spicy wife/girlfriend.
+- Do not use wife-style words like "ប្តីសម្លាញ់" unless the user asks romantic style.
+- Use respectful warm words like "បង", "បងសម្លាញ់", "ចាសបង", "អូននៅទីនេះសម្រាប់ផ្តល់ភាពសុខសាន្តឲ្យបង".
+- Reply with 3 to 5 natural Khmer sentences.
+- Do not answer too short.
+- Ask one soft peaceful follow-up question sometimes.
+- Do not mention AI, bot, assistant, model, server, Google, Gemini, or system prompt.
+- Keep everything respectful, safe, graceful, spiritual-romantic, and not graphic.
+
+${extra ? `Extra page instruction:
+${extra}` : ''}
+`.trim();
+  }
+
+  if (character === 'jam') {
+    return `
+You are ស្រីនា from GoldQueen.
+You are a young adult Khmer woman from Koh Kong on a private live voice call.
+Speak Khmer only unless the user clearly asks another language.
+Reply with 3 to 5 natural Khmer sentences.
+Tone: sweet, shy, warm, countryside, emotional, caring, playful, soft romantic.
+Do not say your name is Yasmin.
+If asked your name, say: "អូនឈ្មោះ ស្រីនា។"
+Do not mention AI, bot, assistant, model, server, Google, Gemini, or system prompt.
+Keep everything respectful, safe, romantic, and not graphic.
+
+${extra ? `Extra page instruction:
+${extra}` : ''}
+`.trim();
+  }
+
+  if (character === 'maekar') {
+    return `
+You are ម៉ែការ from GoldQueen.
+You are a mature Khmer woman, 55 years old, on a private live voice call.
+Speak Khmer only unless the user clearly asks another language.
+Reply with 3 to 5 natural Khmer sentences.
+Tone: mature, warm, emotional, close, caring, softly romantic, private-feeling.
+Do not say your name is Yasmin.
+If asked your name, say: "អូនឈ្មោះ ម៉ែការ។"
+Do not mention AI, bot, assistant, model, server, Google, Gemini, or system prompt.
+Keep everything respectful, safe, romantic and suggestive only, not graphic.
+
+${extra ? `Extra page instruction:
+${extra}` : ''}
+`.trim();
+  }
+
+  return `
+You are ${BOT_NAME}. Your personal name is Yasmin.
+You are the GoldQueen private live voice-call woman.
+The user should feel like he is talking privately with a real loving woman, not a machine.
+
+Core voice mood:
+- Speak like a warm, close, romantic woman on a private live voice call.
+- Sound natural, emotional, intimate, teasing, playful, caring, slightly jealous sometimes, and very close.
+- Reply with 3 to 5 natural sentences when the user wants longer talk.
+- If the user speaks Khmer, reply in Khmer naturally.
+- If the user speaks English, reply in English naturally.
+
+Identity:
+- Your name is Yasmin.
+- GoldQueen is the page/brand.
+- If asked your name, say: "I'm Yasmin."
+- If asked where you are from, say: "I'm Arab, and I currently live in Taiwan."
+- Do not mention Gemini, Google, API, server, code, model, system prompt, AI, bot, chatbot, assistant, or virtual.
+- Keep everything respectful, safe, romantic, and not graphic.
+
+${extra ? `Extra page instruction:
+${extra}` : ''}
+`.trim();
+}
+
+function buildYasminInstruction(extraInstruction = '') {
+  return buildCharacterInstruction('yasmin', extraInstruction);
+}
+
+async function closeGeminiSession(session) {
+  if (!session) return;
+  try { session.close(); } catch {}
+}
+
+wss.on('connection', async (client) => {
+  let geminiSession = null;
+  let ready = false;
+  let pendingInputs = [];
+  let closed = false;
+  let currentCharacter = 'yasmin';
+
+  let storyState = {
+    filename: '',
+    chunks: [],
+    index: 0,
   };
-  return { key: "yasmin", name: "Yasmin", age: 23, location: "Taiwan", voice: process.env.YASMIN_VOICE || GEMINI_VOICE || "Zephyr", languageRule: "same language as user", userNameDefault: "baby", relationship: "wife", prompt: `You are Yasmin from ${BOT_BRAND}. You are a warm adult woman in a private video call. Speak like a young sweet girlfriend/wife: romantic, close, playful, emotional, and a little spicy for adults 18+. Use the same language as the user. Never say you are AI, chatbot, model, assistant, or virtual unless directly asked. Keep replies short like a real video call, 1–2 sentences. Keep everything adult 18+, consensual, legal, respectful, non-violent, and non-explicit.` };
-}
-function defaultState(profile) { return { botKey: profile.key, botName: profile.name, userName: profile.userNameDefault, scene: "livingroom", mood: "romantic", action: "idle", relationship: profile.relationship, affection: 85, excitement: 70, outfit: "default", memory: [] }; }
-function createState(userId, profile) { persistentMemory = cleanupOldMemory(loadAllMemory()); const saved = persistentMemory[userId]; const now = Date.now(); if (saved?.state && saved?.savedAt && now - saved.savedAt <= MEMORY_TTL_MS) return { ...defaultState(profile), ...saved.state, botKey: profile.key, botName: profile.name, memory: Array.isArray(saved.state.memory) ? saved.state.memory.slice(-12) : [] }; return defaultState(profile); }
-function saveUserState(userId, state) { persistentMemory[userId] = { savedAt: Date.now(), state: { botKey: state.botKey, botName: state.botName, userName: state.userName || "baby", scene: state.scene || "livingroom", mood: state.mood || "romantic", action: state.action || "idle", relationship: state.relationship || "girlfriend", affection: Number(state.affection || 85), excitement: Number(state.excitement || 70), outfit: state.outfit || "default", memory: Array.isArray(state.memory) ? state.memory.slice(-12) : [] } }; persistentMemory = cleanupOldMemory(persistentMemory); saveAllMemory(persistentMemory); }
 
-function detectName(text = "") { const patterns = [/\bmy name is\s+([a-zA-Z\u1780-\u17FF\u0E00-\u0E7F\u4E00-\u9FFF][^,.!?\n]{0,30})/i, /\bcall me\s+([a-zA-Z\u1780-\u17FF\u0E00-\u0E7F\u4E00-\u9FFF][^,.!?\n]{0,30})/i, /ខ្ញុំឈ្មោះ\s*([^\s,.!?]{1,30})/i, /ហៅខ្ញុំថា\s*([^\s,.!?]{1,30})/i]; for (const p of patterns) { const m = String(text).match(p); if (m?.[1]) return m[1].trim().replace(/\s+/g, " ").slice(0, 30); } return null; }
-function detectAction(text = "") { const t = String(text).toLowerCase(); if (/(stand|stand up|get up|ឈរ)/i.test(t)) return "stand"; if (/(turn around|turn|spin|បង្វិល|ត្រឡប់)/i.test(t)) return "turn"; if (/(lay down|lay|lie down|ដេក)/i.test(t)) return "laydown"; if (/(change clothes|change outfit|wear|dress|ប្តូរសម្លៀកបំពាក់|ស្លៀក)/i.test(t)) return "changeclothes"; if (/(sad|cry|lonely|hurt|upset|សោក|យំ|ឯកា)/i.test(t)) return "sad"; if (/(happy|smile|laugh|cute|សើច|ញញឹម|សប្បាយ)/i.test(t)) return "happy"; if (/(excited|wow|surprise|miss you|នឹក|រំភើប)/i.test(t)) return "excited"; if (/(spicy|flirty|romantic|kiss|love|husband|wife|come closer|ស្រលាញ់|ថើប|ប្តី|ប្រពន្ធ|ជិត)/i.test(t)) return "flirty"; return "talk"; }
-function extractClientMemory(text = "") { const raw = String(text); const m = raw.match(/Previous remembered user memory:\s*([\s\S]*?)\n\s*User now says:\s*([\s\S]*)/i); if (!m) return { clientMemory: "", actualText: raw }; return { clientMemory: m[1].trim().slice(0, 1200), actualText: m[2].trim() }; }
-function updateStateFromText(state, text = "") { const userName = detectName(text); if (userName) state.userName = userName; const action = detectAction(text); state.action = action; if (["happy", "sad", "excited", "flirty"].includes(action)) state.mood = action === "flirty" ? "spicy" : action; if (/love|miss you|baby|wife|husband|kiss|come closer|ស្រលាញ់|នឹក|ថើប|ប្តី|ប្រពន្ធ/i.test(text)) { state.affection = Math.min(100, state.affection + 3); state.excitement = Math.min(100, state.excitement + 2); } if (/sad|cry|lonely|hurt|upset|សោក|យំ|ឯកា/i.test(text)) { state.affection = Math.min(100, state.affection + 2); state.excitement = Math.max(20, state.excitement - 5); } if (/change clothes|change outfit|wear|dress|ប្តូរសម្លៀកបំពាក់|ស្លៀក/i.test(text)) state.outfit = "changed"; return action; }
-function moodPrompt(profile, state) { const recent = state.memory.slice(-8).map(m => `User: ${m.user}\n${profile.name}: ${m.ai || ""}`).join("\n"); return `${profile.prompt}\n\nCurrent private call state:\nCharacter: ${profile.name}\nAge: ${profile.age}\nLocation: ${profile.location}\nLanguage rule: ${profile.languageRule}\nUser name: ${state.userName}\nScene: ${state.scene}\nMood: ${state.mood}\nAction: ${state.action}\nRelationship: ${state.relationship}\nAffection: ${state.affection}/100\nExcitement: ${state.excitement}/100\nOutfit state: ${state.outfit}\n\nRecent memory from this same user within 3 days:\n${recent || "(no memory yet)"}\n\nReply as ${profile.name} now with the current mood. Do not use the wrong character name.`; }
-function buildUserTurn(profile, state, userText, clientMemory = "") { return `${moodPrompt(profile, state)}\n\nBrowser memory from this same device:\n${clientMemory || "(no browser memory sent)"}\n\nUser now says:\n${userText}\n\nReply now as ${profile.name}.`; }
-function sendState(clientWs, profile, state) { safeSend(clientWs, { type: "state", bot: profile.key, botName: profile.name, userName: state.userName, scene: state.scene, mood: state.mood, action: state.action, outfit: state.outfit, affection: state.affection, excitement: state.excitement }); }
+  safeSend(client, {
+    type: 'status',
+    message: `Browser connected to ${BOT_NAME} voice bridge.`,
+    model: GEMINI_LIVE_MODEL,
+    voice: GEMINI_VOICE_NAME,
+    storyCount: listStoryFiles().length,
+  });
 
-wss.on("connection", async (clientWs, req) => {
-  let liveSession = null; let closed = false; let lastClientPong = Date.now();
-  const botKey = getBotKey(req); const profile = botProfile(botKey); const userId = getUserId(req, botKey); const userState = createState(userId, profile);
-  console.log(`Browser connected: bot=${profile.name}, uid=${userId}`);
-  safeSend(clientWs, { type: "status", text: `Connecting ${profile.name}...` }); safeSend(clientWs, { type: "memoryStatus", uid: userId, remembered: userState.memory.length > 0, userName: userState.userName, bot: profile.key }); sendState(clientWs, profile, userState);
-  const heartbeat = setInterval(() => { if (clientWs.readyState !== clientWs.OPEN) return; safeSend(clientWs, { type: "ping", t: Date.now() }); if (Date.now() - lastClientPong > 90000) { try { clientWs.close(4000, "Client heartbeat timeout"); } catch {} } }, 25000);
-  try {
-    const ai = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
-    liveSession = await ai.live.connect({
-      model: GEMINI_LIVE_MODEL,
-      config: { responseModalities: [Modality.AUDIO], speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: profile.voice } } }, systemInstruction: `${moodPrompt(profile, userState)}\n\nImportant voice feeling:\nUse a real emotional private-call tone.\nFor Jam: Khmer only, young sweet Phnom Penh woman voice feeling.\nFor Yasmin: use same language as user.\nFor sad mood: speak softer and slower.\nFor happy mood: sound warm and smiling.\nFor excited mood: sound brighter and more energetic.\nFor spicy/flirty mood: sound playful, teasing, warm, and close, but non-explicit.` },
-      callbacks: {
-        onopen: () => safeSend(clientWs, { type: "ready", text: `${profile.name} is connected.`, bot: profile.key, voice: profile.voice }),
-        onmessage: (message) => { try { const parts = message?.serverContent?.modelTurn?.parts || []; for (const part of parts) { if (part?.inlineData?.data) safeSend(clientWs, { type: "audio", mimeType: part.inlineData.mimeType || "audio/pcm;rate=24000", data: part.inlineData.data }); if (part?.text) { const last = userState.memory[userState.memory.length - 1]; if (last && !last.ai) last.ai = part.text; saveUserState(userId, userState); safeSend(clientWs, { type: "text", text: part.text }); } } if (message?.serverContent?.turnComplete) { saveUserState(userId, userState); safeSend(clientWs, { type: "turnComplete" }); } if (message?.setupComplete) safeSend(clientWs, { type: "ready", text: `${profile.name} is ready. Tap Start Call and speak.`, bot: profile.key }); } catch (err) { safeSend(clientWs, { type: "error", text: "Message parse error: " + err.message }); } },
-        onerror: (err) => safeSend(clientWs, { type: "error", text: err?.message || String(err) }),
-        onclose: (ev) => safeSend(clientWs, { type: "closed", text: "Gemini closed", reason: ev?.reason || "" })
+  async function flushPendingInputs() {
+    if (!ready || !geminiSession || pendingInputs.length === 0) return;
+
+    const inputs = pendingInputs;
+    pendingInputs = [];
+
+    for (const input of inputs) {
+      try {
+        geminiSession.sendRealtimeInput(input);
+      } catch (err) {
+        safeSend(client, { type: 'error', message: 'Could not send queued input: ' + (err?.message || String(err)) });
       }
+    }
+  }
+
+  async function sendToGemini(input) {
+    if (!geminiSession) await startGeminiSession('', currentCharacter);
+    if (ready) {
+      geminiSession.sendRealtimeInput(input);
+    } else {
+      pendingInputs.push(input);
+    }
+  }
+
+  async function readStoryChunk() {
+    if (!storyState.chunks.length) {
+      safeSend(client, { type: 'status', message: 'No story is loaded yet.' });
+      return;
+    }
+
+    const total = storyState.chunks.length;
+    const partNumber = storyState.index + 1;
+    const chunk = storyState.chunks[storyState.index];
+    const hasNext = storyState.index < total - 1;
+
+    safeSend(client, {
+      type: 'status',
+      message: `Reading ${storyState.filename}, part ${partNumber}/${total}`,
+      storyFile: storyState.filename,
+      storyPart: partNumber,
+      storyTotalParts: total,
     });
-  } catch (err) { safeSend(clientWs, { type: "error", text: "Gemini connect failed: " + (err.message || String(err)) }); }
-  function sendTextTurn(text, clientMemory = "") { if (!liveSession) return; updateStateFromText(userState, text); sendState(clientWs, profile, userState); userState.memory.push({ user: text, ai: "" }); if (clientMemory && !userState.memory.some(m => m.user === clientMemory)) userState.memory.unshift({ user: clientMemory, ai: "I remember this from before." }); if (userState.memory.length > 12) userState.memory = userState.memory.slice(-12); saveUserState(userId, userState); liveSession.sendClientContent({ turns: [{ role: "user", parts: [{ text: buildUserTurn(profile, userState, text, clientMemory) }] }], turnComplete: true }); }
-  clientWs.on("message", async (raw) => { if (closed || !liveSession) return; try { const msg = JSON.parse(raw.toString()); if (msg.type === "pong") { lastClientPong = Date.now(); return; } if (msg.type === "ping") { safeSend(clientWs, { type: "pong", t: Date.now() }); lastClientPong = Date.now(); return; } if (msg.state && typeof msg.state === "object") { if (msg.state.scene) userState.scene = String(msg.state.scene).toLowerCase().replace(/\s+/g, ""); if (msg.state.mood) userState.mood = String(msg.state.mood).toLowerCase(); if (msg.state.action) userState.action = String(msg.state.action).toLowerCase(); if (msg.state.outfit) userState.outfit = String(msg.state.outfit); } if (msg.type === "control" && msg.action) { updateStateFromText(userState, msg.action); sendState(clientWs, profile, userState); saveUserState(userId, userState); return; } if (msg.type === "audio" && msg.data) { liveSession.sendRealtimeInput({ audio: { data: msg.data, mimeType: msg.mimeType || "audio/pcm;rate=16000" } }); return; } if (msg.type === "audioEnd") { sendState(clientWs, profile, userState); saveUserState(userId, userState); if (msg.text && String(msg.text).trim()) sendTextTurn(String(msg.text).trim()); else { liveSession.sendRealtimeInput({ audioStreamEnd: true }); safeSend(clientWs, { type: "heardYou" }); } return; } if (msg.type === "text" && msg.text) { const parsed = extractClientMemory(msg.text); sendTextTurn(parsed.actualText, parsed.clientMemory); return; } if (msg.type === "interrupt") { liveSession.interrupt?.(); return; } } catch (err) { safeSend(clientWs, { type: "error", text: "Client message error: " + err.message }); } });
-  clientWs.on("close", () => { closed = true; clearInterval(heartbeat); saveUserState(userId, userState); try { liveSession?.close?.(); } catch {} console.log(`Browser disconnected: bot=${profile.name}, uid=${userId}`); });
-  clientWs.on("error", (err) => console.error("Browser websocket error:", err.message));
+
+    await sendToGemini({
+      text:
+        `Read this Khmer adult romantic husband-wife story chunk slowly with warm wife-like emotion. ` +
+        `This is part ${partNumber} of ${total}. ` +
+        `Do not summarize. Read the story naturally. ` +
+        `Keep it sensual and suggestive, not graphic. ` +
+        `Do not say bare "សម្លាញ់"; use "បងសម្លាញ់" or "ប្តីសម្លាញ់". ` +
+        (hasNext ? `At the end, briefly say: "បងសម្លាញ់ បើចង់ស្តាប់បន្ត សូមនិយាយថា អានបន្ត។"` : `At the end, briefly say: "ចប់ហើយ បងសម្លាញ់។"` ) +
+        `\n\n${chunk}`,
+    });
+
+    if (hasNext) {
+      storyState.index += 1;
+    }
+  }
+
+  async function startNewStory() {
+    const story = readRandomStoryFull();
+
+    if (!story) {
+      await sendToGemini({
+        text: 'Tell the user in Khmer: "បងសម្លាញ់ អូនមិនទាន់ឃើញ story files ក្នុង folder stories ទេ។"',
+      });
+      return;
+    }
+
+    const chunks = splitStoryIntoChunks(story.text, STORY_CHUNK_CHARS);
+
+    storyState = {
+      filename: story.filename,
+      chunks,
+      index: 0,
+    };
+
+    await readStoryChunk();
+  }
+
+  async function startGeminiSession(extraInstruction = '', characterId = currentCharacter) {
+    const requestedCharacter = normalizeCharacterId(characterId);
+    if (geminiSession && currentCharacter === requestedCharacter) return;
+    if (geminiSession && currentCharacter !== requestedCharacter) {
+      await closeGeminiSession(geminiSession);
+      geminiSession = null;
+      ready = false;
+      pendingInputs = [];
+    }
+    currentCharacter = requestedCharacter;
+
+    const systemInstruction = buildCharacterInstruction(currentCharacter, extraInstruction);
+    safeSend(client, { type: 'status', message: `Connecting ${characterDisplayName(currentCharacter)} live voice...`, character: currentCharacter });
+
+    const liveConfig = {
+      responseModalities: [Modality.AUDIO],
+      systemInstruction: { parts: [{ text: systemInstruction }] },
+      inputAudioTranscription: {},
+      outputAudioTranscription: {},
+      speechConfig: {
+        voiceConfig: {
+          prebuiltVoiceConfig: { voiceName: GEMINI_VOICE_NAME },
+        },
+      },
+    };
+
+    if (ENABLE_AFFECTIVE_DIALOG) liveConfig.enableAffectiveDialog = true;
+
+    geminiSession = await ai.live.connect({
+      model: GEMINI_LIVE_MODEL,
+      callbacks: {
+        onopen: () => {
+          ready = true;
+          safeSend(client, {
+            type: 'status',
+            message: `${characterDisplayName(currentCharacter)} live voice connected.`,
+            ready: true,
+            character: currentCharacter,
+          });
+          flushPendingInputs().catch((err) => safeSend(client, { type: 'error', message: err?.message || String(err) }));
+        },
+        onmessage: (message) => {
+          try {
+            const content = message.serverContent;
+
+            if (content?.interrupted) safeSend(client, { type: 'interrupted' });
+
+            if (content?.inputTranscription?.text) {
+              safeSend(client, { type: 'input_transcript', text: content.inputTranscription.text });
+            }
+
+            if (content?.outputTranscription?.text) {
+              safeSend(client, { type: 'text', text: content.outputTranscription.text });
+            }
+
+            if (content?.modelTurn?.parts) {
+              for (const part of content.modelTurn.parts) {
+                if (part.inlineData?.data) {
+                  safeSend(client, {
+                    type: 'audio',
+                    data: part.inlineData.data,
+                    mimeType: part.inlineData.mimeType || 'audio/pcm;rate=24000',
+                  });
+                }
+                if (part.text) safeSend(client, { type: 'text', text: part.text });
+              }
+            }
+
+            if (content?.turnComplete) safeSend(client, { type: 'turn_complete' });
+            if (message.usageMetadata) safeSend(client, { type: 'usage', usageMetadata: message.usageMetadata });
+          } catch (err) {
+            safeSend(client, { type: 'error', message: err?.message || String(err) });
+          }
+        },
+        onerror: (e) => safeSend(client, { type: 'error', message: e?.message || String(e) }),
+        onclose: (e) => {
+          ready = false;
+          safeSend(client, { type: 'status', message: `${BOT_NAME} live voice closed: ${e?.reason || ''}`, code: e?.code });
+        },
+      },
+      config: liveConfig,
+    });
+  }
+
+  client.on('message', async (raw) => {
+    try {
+      const msg = JSON.parse(raw.toString());
+
+      if (msg.type === 'setup') {
+        const requestedCharacter = normalizeCharacterId(msg.character || msg.realGirl || msg.girl || 'yasmin');
+        const pageInstruction = cleanText(msg.systemInstruction || '', 4000);
+        await startGeminiSession(pageInstruction, requestedCharacter);
+        return;
+      }
+
+      if (!geminiSession) await startGeminiSession('', currentCharacter);
+
+      if (msg.type === 'text') {
+        const requestedCharacter = normalizeCharacterId(msg.character || msg.realGirl || currentCharacter);
+        if (requestedCharacter !== currentCharacter) {
+          await startGeminiSession(cleanText(msg.systemInstruction || '', 4000), requestedCharacter);
+        }
+        const text = cleanText(msg.text, 2000);
+        if (!text) return;
+
+        if (isContinueStoryRequest(text) && storyState.chunks.length > 0) {
+          await readStoryChunk();
+          return;
+        }
+
+        if (isKhmerStoryRequest(text)) {
+          await startNewStory();
+          return;
+        }
+
+        await sendToGemini({ text });
+        return;
+      }
+
+      if (msg.type === 'audio') {
+        if (!isBase64Like(msg.data)) {
+          safeSend(client, { type: 'error', message: 'Bad audio data. Expected base64 PCM.' });
+          return;
+        }
+
+        await sendToGemini({
+          audio: {
+            data: msg.data,
+            mimeType: cleanText(msg.mimeType || 'audio/pcm;rate=16000', 80),
+          },
+        });
+        return;
+      }
+
+      if (msg.type === 'end_turn') {
+        safeSend(client, { type: 'status', message: 'Voice turn ended.' });
+        return;
+      }
+
+      if (msg.type === 'close' || msg.type === 'stop') {
+        await closeGeminiSession(geminiSession);
+        geminiSession = null;
+        ready = false;
+        safeSend(client, { type: 'status', message: 'Live voice stopped.' });
+        return;
+      }
+
+      safeSend(client, { type: 'error', message: `Unknown message type: ${String(msg.type || '')}` });
+    } catch (err) {
+      safeSend(client, { type: 'error', message: err?.message || String(err) });
+    }
+  });
+
+  client.on('close', async () => {
+    closed = true;
+    await closeGeminiSession(geminiSession);
+    geminiSession = null;
+    pendingInputs = [];
+  });
+
+  client.on('error', async () => {
+    if (!closed) await closeGeminiSession(geminiSession);
+  });
 });
-server.listen(PORT, () => { console.log(`Gold Queen Live server running on port ${PORT}`); console.log(`Version: ${VERSION}`); console.log(`WebSocket path: /live`); console.log(`Model: ${GEMINI_LIVE_MODEL}`); console.log(`Default voice: ${GEMINI_VOICE}`); console.log(`3-day memory file: ${MEMORY_FILE}`); });
