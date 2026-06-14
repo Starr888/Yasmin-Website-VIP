@@ -425,6 +425,15 @@ wss.on('connection', async (client) => {
     }
   }
 
+  // Browser index.html sends {type:"audioEnd"} after the user releases TALK.
+  // Some older pages send {type:"end_turn"}.
+  // Gemini Live SDK does not need a special command here for this server version,
+  // but the browser needs a clean acknowledgement instead of "Unknown message type".
+  async function finishUserAudioTurn() {
+    safeSend(client, { type: 'heardYou' });
+    safeSend(client, { type: 'status', message: 'Voice turn ended.' });
+  }
+
   async function readStoryChunk() {
     if (!storyState.chunks.length) {
       safeSend(client, { type: 'status', message: 'No story is loaded yet.' });
@@ -514,12 +523,20 @@ wss.on('connection', async (client) => {
       callbacks: {
         onopen: () => {
           ready = true;
+
+          // Newer live.html pages listen for "status"; older call/index.html listens for "ready".
           safeSend(client, {
             type: 'status',
             message: `${characterDisplayName(currentCharacter)} live voice connected.`,
             ready: true,
             character: currentCharacter,
           });
+          safeSend(client, {
+            type: 'ready',
+            message: `${characterDisplayName(currentCharacter)} is ready.`,
+            character: currentCharacter,
+          });
+
           flushPendingInputs().catch((err) => safeSend(client, { type: 'error', message: err?.message || String(err) }));
         },
         onmessage: (message) => {
@@ -549,7 +566,11 @@ wss.on('connection', async (client) => {
               }
             }
 
-            if (content?.turnComplete) safeSend(client, { type: 'turn_complete' });
+            if (content?.turnComplete) {
+              // Support both server/client naming styles.
+              safeSend(client, { type: 'turn_complete' });
+              safeSend(client, { type: 'turnComplete' });
+            }
             if (message.usageMetadata) safeSend(client, { type: 'usage', usageMetadata: message.usageMetadata });
           } catch (err) {
             safeSend(client, { type: 'error', message: err?.message || String(err) });
@@ -568,6 +589,11 @@ wss.on('connection', async (client) => {
   client.on('message', async (raw) => {
     try {
       const msg = JSON.parse(raw.toString());
+
+      if (msg.type === 'ping') {
+        safeSend(client, { type: 'pong', ts: msg.ts || Date.now() });
+        return;
+      }
 
       if (msg.type === 'setup') {
         const requestedCharacter = normalizeCharacterId(msg.character || msg.realGirl || msg.girl || 'yasmin');
@@ -615,8 +641,18 @@ wss.on('connection', async (client) => {
         return;
       }
 
-      if (msg.type === 'end_turn') {
-        safeSend(client, { type: 'status', message: 'Voice turn ended.' });
+      if (msg.type === 'audioEnd' || msg.type === 'end_turn') {
+        await finishUserAudioTurn();
+        return;
+      }
+
+      if (msg.type === 'control' || msg.type === 'action' || msg.type === 'mood' || msg.type === 'state') {
+        // Front-end motion buttons can send these. Echo action/state back so the page can update
+        // without breaking the voice server.
+        if (msg.action) safeSend(client, { type: 'action', action: cleanText(msg.action, 80) });
+        if (msg.mood) safeSend(client, { type: 'mood', mood: cleanText(msg.mood, 80) });
+        if (msg.state && typeof msg.state === 'object') safeSend(client, { type: 'state', ...msg.state });
+        safeSend(client, { type: 'status', message: 'Motion command received.' });
         return;
       }
 
