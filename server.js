@@ -18,7 +18,7 @@ const BOT_NAME = process.env.BOT_NAME || 'Yasmin';
 const GEMINI_VOICE_NAME = process.env.GEMINI_VOICE_NAME || 'Kore';
 
 // Bigger chunk = longer reading each time. If voice cuts off, lower to 1800.
-const STORY_CHUNK_CHARS = Number(process.env.STORY_CHUNK_CHARS || 2500);
+const STORY_CHUNK_CHARS = Number(process.env.STORY_CHUNK_CHARS || 700);
 
 const ENABLE_AFFECTIVE_DIALOG =
   String(process.env.ENABLE_AFFECTIVE_DIALOG || 'false').toLowerCase() === 'true';
@@ -304,8 +304,8 @@ The user should feel like he is talking privately with a real loving woman, not 
 
 Core voice mood:
 - Speak like a warm, close, romantic woman on a private live voice call.
-- Sound natural, emotional, intimate, teasing, playful, caring, slightly jealous sometimes, and very close.
-- Reply with 3 to 5 natural sentences when the user wants longer talk.
+- Sound natural, emotional, intimate, teasing, playful, caring, slightly jealous sometimes, and very close, but answer quickly.
+- Reply fast with 1 short natural sentence for normal chat. Only speak longer if the user asks for a story.
 - If the user speaks Khmer, reply in Khmer naturally.
 - If the user speaks English, reply in English naturally.
 
@@ -374,6 +374,13 @@ wss.on('connection', async (client) => {
     } else {
       pendingInputs.push(input);
     }
+  }
+
+  // The phone/browser page sends audioEnd after TALK is released.
+  // This server accepts it so the page does not show "Unknown message type: audioEnd".
+  async function finishUserAudioTurn() {
+    safeSend(client, { type: 'heardYou' });
+    safeSend(client, { type: 'status', message: 'Voice turn ended.' });
   }
 
   async function readStoryChunk() {
@@ -471,6 +478,14 @@ wss.on('connection', async (client) => {
             ready: true,
             character: currentCharacter,
           });
+
+          // Older call pages listen for type:"ready".
+          safeSend(client, {
+            type: 'ready',
+            message: `${characterDisplayName(currentCharacter)} is ready.`,
+            character: currentCharacter,
+          });
+
           flushPendingInputs().catch((err) => safeSend(client, { type: 'error', message: err?.message || String(err) }));
         },
         onmessage: (message) => {
@@ -500,7 +515,10 @@ wss.on('connection', async (client) => {
               }
             }
 
-            if (content?.turnComplete) safeSend(client, { type: 'turn_complete' });
+            if (content?.turnComplete) {
+              safeSend(client, { type: 'turn_complete' });
+              safeSend(client, { type: 'turnComplete' });
+            }
             if (message.usageMetadata) safeSend(client, { type: 'usage', usageMetadata: message.usageMetadata });
           } catch (err) {
             safeSend(client, { type: 'error', message: err?.message || String(err) });
@@ -519,6 +537,11 @@ wss.on('connection', async (client) => {
   client.on('message', async (raw) => {
     try {
       const msg = JSON.parse(raw.toString());
+
+      if (msg.type === 'ping') {
+        safeSend(client, { type: 'pong', ts: msg.ts || Date.now() });
+        return;
+      }
 
       if (msg.type === 'setup') {
         const requestedCharacter = normalizeCharacterId(msg.character || msg.realGirl || msg.girl || 'yasmin');
@@ -566,8 +589,18 @@ wss.on('connection', async (client) => {
         return;
       }
 
-      if (msg.type === 'end_turn') {
-        safeSend(client, { type: 'status', message: 'Voice turn ended.' });
+      if (msg.type === 'audioEnd' || msg.type === 'end_turn') {
+        await finishUserAudioTurn();
+        return;
+      }
+
+      if (msg.type === 'control' || msg.type === 'action' || msg.type === 'mood' || msg.type === 'state') {
+        // The front-end motion buttons can send these. Echo back so the page updates
+        // and never breaks the voice server.
+        if (msg.action) safeSend(client, { type: 'action', action: cleanText(msg.action, 80) });
+        if (msg.mood) safeSend(client, { type: 'mood', mood: cleanText(msg.mood, 80) });
+        if (msg.state && typeof msg.state === 'object') safeSend(client, { type: 'state', ...msg.state });
+        safeSend(client, { type: 'status', message: 'Motion command received.' });
         return;
       }
 
