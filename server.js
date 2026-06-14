@@ -376,11 +376,29 @@ wss.on('connection', async (client) => {
     }
   }
 
-  // The phone/browser page sends audioEnd after TALK is released.
-  // This server accepts it so the page does not show "Unknown message type: audioEnd".
+  async function sendAudioStreamEndToGemini() {
+    if (!geminiSession) return;
+
+    const endInput = { audioStreamEnd: true };
+
+    if (ready) {
+      try {
+        geminiSession.sendRealtimeInput(endInput);
+      } catch (err) {
+        safeSend(client, { type: 'error', message: 'Could not finish audio stream: ' + (err?.message || String(err)) });
+      }
+    } else {
+      pendingInputs.push(endInput);
+    }
+  }
+
+  // The browser page sends audioEnd after the user releases TALK.
+  // This must be forwarded to Gemini as audioStreamEnd so Gemini knows
+  // the user finished speaking and can reply with voice.
   async function finishUserAudioTurn() {
+    await sendAudioStreamEndToGemini();
     safeSend(client, { type: 'heardYou' });
-    safeSend(client, { type: 'status', message: 'Voice turn ended.' });
+    safeSend(client, { type: 'status', message: 'Voice turn ended. Waiting for Yasmin...' });
   }
 
   async function readStoryChunk() {
@@ -478,14 +496,11 @@ wss.on('connection', async (client) => {
             ready: true,
             character: currentCharacter,
           });
-
-          // Older call pages listen for type:"ready".
           safeSend(client, {
             type: 'ready',
             message: `${characterDisplayName(currentCharacter)} is ready.`,
             character: currentCharacter,
           });
-
           flushPendingInputs().catch((err) => safeSend(client, { type: 'error', message: err?.message || String(err) }));
         },
         onmessage: (message) => {
@@ -595,8 +610,6 @@ wss.on('connection', async (client) => {
       }
 
       if (msg.type === 'control' || msg.type === 'action' || msg.type === 'mood' || msg.type === 'state') {
-        // The front-end motion buttons can send these. Echo back so the page updates
-        // and never breaks the voice server.
         if (msg.action) safeSend(client, { type: 'action', action: cleanText(msg.action, 80) });
         if (msg.mood) safeSend(client, { type: 'mood', mood: cleanText(msg.mood, 80) });
         if (msg.state && typeof msg.state === 'object') safeSend(client, { type: 'state', ...msg.state });
