@@ -23,6 +23,11 @@ const STORY_CHUNK_CHARS = Number(process.env.STORY_CHUNK_CHARS || 700);
 const ENABLE_AFFECTIVE_DIALOG =
   String(process.env.ENABLE_AFFECTIVE_DIALOG || 'false').toLowerCase() === 'true';
 
+// Free public promo call limit.
+// For production, use a real DB. This JSON file is good for Render tests/demo.
+const FREE_DAILY_SECONDS = Number(process.env.FREE_DAILY_SECONDS || 120);
+const FREE_USAGE_FILE = path.join(process.cwd(), 'free-call-usage.json');
+
 if (!GEMINI_API_KEY) {
   console.error('Missing GEMINI_API_KEY in Render environment variables.');
   process.exit(1);
@@ -184,6 +189,7 @@ app.get('/health', (_req, res) => {
     storyFoldersFound: storyFoldersFound(),
     adultStyle: 'romantic, intimate, suggestive, not graphic',
     hasGeminiKey: Boolean(GEMINI_API_KEY),
+    freeDailySeconds: FREE_DAILY_SECONDS,
   });
 });
 
@@ -207,6 +213,60 @@ function safeSend(client, payload) {
 function cleanText(value, maxLength = 4000) {
   if (typeof value !== 'string') return '';
   return value.trim().slice(0, maxLength);
+}
+
+function todayKey() {
+  return new Date().toISOString().slice(0, 10);
+}
+
+function safeUserId(value) {
+  return cleanText(value || 'anonymous', 120).replace(/[^a-zA-Z0-9_-]/g, '_') || 'anonymous';
+}
+
+function readFreeUsage() {
+  try {
+    if (!fs.existsSync(FREE_USAGE_FILE)) return {};
+    const raw = fs.readFileSync(FREE_USAGE_FILE, 'utf8');
+    const data = JSON.parse(raw);
+    return data && typeof data === 'object' ? data : {};
+  } catch {
+    return {};
+  }
+}
+
+function writeFreeUsage(data) {
+  try {
+    fs.writeFileSync(FREE_USAGE_FILE, JSON.stringify(data, null, 2), 'utf8');
+  } catch (err) {
+    console.error('Could not write free usage file:', err?.message || String(err));
+  }
+}
+
+function getFreeSecondsUsed(uid) {
+  const data = readFreeUsage();
+  const day = todayKey();
+  return Number(data?.[day]?.[uid] || 0);
+}
+
+function addFreeSeconds(uid, seconds) {
+  const data = readFreeUsage();
+  const day = todayKey();
+  if (!data[day]) data[day] = {};
+  data[day][uid] = Math.max(0, Number(data[day][uid] || 0) + Number(seconds || 0));
+
+  // Keep only today/yesterday to stop file growing forever.
+  const days = Object.keys(data).sort();
+  while (days.length > 2) {
+    const old = days.shift();
+    delete data[old];
+  }
+
+  writeFreeUsage(data);
+  return data[day][uid];
+}
+
+function freeRemainingSeconds(uid) {
+  return Math.max(0, FREE_DAILY_SECONDS - getFreeSecondsUsed(uid));
 }
 
 
@@ -299,12 +359,12 @@ ${extra}` : ''}
 
   return `
 You are ${BOT_NAME}. Your personal name is Yasmin.
-You are the GoldQueen private live voice-call woman.
+You are the GoldQueen private live voice-call woman and VIP preview host.
 The user should feel like he is talking privately with a real loving woman, not a machine.
 
 Core voice mood:
-- Speak like a warm, close, romantic woman on a private live voice call.
-- Sound natural, emotional, intimate, teasing, playful, caring, slightly jealous sometimes, and very close, but answer quickly.
+- Speak like a warm, close, romantic adult woman on a private live voice call, like a sweet wife-style character.
+- Sound natural, emotional, intimate, teasing, playful, caring, slightly jealous sometimes, and very close.
 - Reply fast with 1 short natural sentence for normal chat. Only speak longer if the user asks for a story.
 - If the user speaks Khmer, reply in Khmer naturally.
 - If the user speaks English, reply in English naturally.
@@ -315,7 +375,7 @@ Identity:
 - If asked your name, say: "I'm Yasmin."
 - If asked where you are from, say: "I'm Arab, and I currently live in Taiwan."
 - Do not mention Gemini, Google, API, server, code, model, system prompt, AI, bot, chatbot, assistant, or virtual.
-- Keep everything respectful, safe, romantic, and not graphic.
+- Keep everything respectful, safe, romantic, suggestive, Facebook-safe, and not graphic. Sometimes gently remind free users that VIP has more private call time, videos, pictures, and romantic story mode.
 
 ${extra ? `Extra page instruction:
 ${extra}` : ''}
@@ -331,12 +391,56 @@ async function closeGeminiSession(session) {
   try { session.close(); } catch {}
 }
 
-wss.on('connection', async (client) => {
+wss.on('connection', async (client, req) => {
   let geminiSession = null;
   let ready = false;
   let pendingInputs = [];
   let closed = false;
   let currentCharacter = 'yasmin';
+
+  const reqUrl = new URL(req.url || '/', 'https://local');
+  const uid = safeUserId(reqUrl.searchParams.get('uid') || reqUrl.searchParams.get('user') || 'anonymous');
+  const startedAt = Date.now();
+  let freeAlreadyEnded = false;
+
+  function sendFreeUsageStatus() {
+    const used = getFreeSecondsUsed(uid);
+    const remaining = Math.max(0, FREE_DAILY_SECONDS - used);
+    safeSend(client, {
+      type: 'freeUsage',
+      uid,
+      used,
+      remaining,
+      limit: FREE_DAILY_SECONDS,
+      day: todayKey(),
+    });
+    return remaining;
+  }
+
+  const initialRemaining = sendFreeUsageStatus();
+  if (initialRemaining <= 0) {
+    safeSend(client, {
+      type: 'freeLimit',
+      message: 'Your free 2-minute preview is finished for today. Subscribe for private call, more videos, and pictures.',
+      remaining: 0,
+      limit: FREE_DAILY_SECONDS,
+    });
+    try { client.close(4008, 'free daily limit reached'); } catch {}
+    return;
+  }
+
+  const freeLimitTimer = setTimeout(() => {
+    if (freeAlreadyEnded) return;
+    freeAlreadyEnded = true;
+    addFreeSeconds(uid, initialRemaining);
+    safeSend(client, {
+      type: 'freeLimit',
+      message: 'Your free 2-minute preview is finished for today. Subscribe for private call, more videos, and pictures.',
+      remaining: 0,
+      limit: FREE_DAILY_SECONDS,
+    });
+    try { client.close(4008, 'free daily limit reached'); } catch {}
+  }, initialRemaining * 1000);
 
   let storyState = {
     filename: '',
@@ -378,9 +482,7 @@ wss.on('connection', async (client) => {
 
   async function sendAudioStreamEndToGemini() {
     if (!geminiSession) return;
-
     const endInput = { audioStreamEnd: true };
-
     if (ready) {
       try {
         geminiSession.sendRealtimeInput(endInput);
@@ -392,9 +494,6 @@ wss.on('connection', async (client) => {
     }
   }
 
-  // The browser page sends audioEnd after the user releases TALK.
-  // This must be forwarded to Gemini as audioStreamEnd so Gemini knows
-  // the user finished speaking and can reply with voice.
   async function finishUserAudioTurn() {
     await sendAudioStreamEndToGemini();
     safeSend(client, { type: 'heardYou' });
@@ -633,6 +732,14 @@ wss.on('connection', async (client) => {
 
   client.on('close', async () => {
     closed = true;
+    clearTimeout(freeLimitTimer);
+
+    if (!freeAlreadyEnded) {
+      const elapsed = Math.ceil((Date.now() - startedAt) / 1000);
+      addFreeSeconds(uid, Math.min(elapsed, initialRemaining));
+      freeAlreadyEnded = true;
+    }
+
     await closeGeminiSession(geminiSession);
     geminiSession = null;
     pendingInputs = [];
